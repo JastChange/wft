@@ -205,6 +205,45 @@ def test_host_key_unknown_fails_fast(tmp_path: Path) -> None:
     assert outcome.error["retryable"] is False
 
 
+def test_host_key_mismatch_is_classified(tmp_path: Path) -> None:
+    script = tmp_path / "ok.sh"
+    script.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+
+    async def _run(host, port, key_path, known_hosts_path):
+        wrong = asyncssh.generate_private_key("ssh-ed25519")
+        mismatch = tmp_path / "mismatch_known_hosts"
+        _known_hosts(mismatch, host, port, wrong)
+        return await execute_script(
+            node=_node(host, port, key_path=key_path), script=_script(script),
+            known_hosts_path=mismatch, connect_timeout_sec=5, exec_timeout_sec=2,
+        )
+
+    outcome = _run_server_and(_run, tmp_path)
+    assert outcome.error["class"] == "host_key_mismatch"
+    assert outcome.error["category"] == "SECURITY"
+    assert outcome.error["retryable"] is False
+
+
+def test_auth_failed_is_classified(tmp_path: Path) -> None:
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+
+    async def _run(host, port, key_path, known_hosts_path):
+        wrong = asyncssh.generate_private_key("ssh-ed25519")
+        wrong_path = tmp_path / "wrong-key"
+        wrong_path.write_bytes(wrong.export_private_key())
+        os.chmod(wrong_path, 0o600)
+        return await execute_script(
+            node=_node(host, port, key_path=wrong_path), script=_script(script_path),
+            known_hosts_path=known_hosts_path, connect_timeout_sec=5, exec_timeout_sec=2,
+        )
+
+    outcome = _run_server_and(_run, tmp_path)
+    assert outcome.error["class"] == "auth_failed"
+    assert outcome.error["category"] == "PERMANENT"
+    assert outcome.error["retryable"] is False
+
+
 def test_exec_timeout_maps_to_exec_timeout(tmp_path: Path) -> None:
     script_path = tmp_path / "slow.sh"
     script_path.write_text("#!/bin/bash\nsleep 3\nexit 0\n", encoding="utf-8")
