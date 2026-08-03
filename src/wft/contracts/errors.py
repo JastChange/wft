@@ -23,3 +23,11 @@ class WFTScriptRegistryError(WFTConfigError):
 
 class WFTUserError(WFTError):
     """Raised for user-facing input problems that should exit with code 2."""
+
+
+class WFTIdempotencyConflict(WFTError):
+    """An idempotency_key was reused with different parameters (exit 2)."""
+
+
+class WFTStorageError(WFTError):
+    """A storage-layer operation failed (database, blob, or outbox write)."""
