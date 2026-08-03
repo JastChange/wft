@@ -160,6 +160,28 @@ def test_build_batch_summary_is_contract05_valid() -> None:
     assert validate_contract_all("contract-05-batch-summary", summary) == []
 
 
+def test_batch_status_mapping_follows_contract() -> None:
+    """§7: trustworthy node failures are SUCCESS/failed; only no-trusted-result is FAILED."""
+    from wft.orchestration.run import _batch_status, _run_exit_code
+
+    # All succeeded, no degradation.
+    assert _batch_status(degraded=False, any_succeeded=True, any_failed=False) == ("SUCCESS", "success")
+    assert _run_exit_code("SUCCESS", "success") == 0
+    # All failed but trustworthy (exec_nonzero) -> SUCCESS/failed, exit 1.
+    assert _batch_status(degraded=False, any_succeeded=False, any_failed=True) == ("SUCCESS", "failed")
+    assert _run_exit_code("SUCCESS", "failed") == 1
+    # Mixed -> SUCCESS/partial, exit 1.
+    assert _batch_status(degraded=False, any_succeeded=True, any_failed=True) == ("SUCCESS", "partial")
+    assert _run_exit_code("SUCCESS", "partial") == 1
+    # Pure non-critical degradation -> DEGRADED/success, exit 1.
+    assert _batch_status(degraded=True, any_succeeded=True, any_failed=False) == ("DEGRADED", "success")
+    assert _run_exit_code("DEGRADED", "success") == 1
+    # Degradation combined with node failures -> DEGRADED/partial.
+    assert _batch_status(degraded=True, any_succeeded=True, any_failed=True) == ("DEGRADED", "partial")
+    # No trustworthy result -> FAILED, exit 2.
+    assert _run_exit_code("FAILED", "failed") == 2
+
+
 # ------------------------------------------------------------------ create_run
 
 
@@ -269,11 +291,16 @@ def test_success_execution_persists_contract03_and_summary(tmp_path: Path) -> No
 
 
 def test_failure_execution_persisted(tmp_path: Path) -> None:
+    """A trustworthy node failure (exec_nonzero) is SUCCESS/failed, exit 1 (§7).
+
+    FAILED/exit 2 is reserved for a batch with no trustworthy result, so a
+    script that ran and returned a non-zero exit must not be Run FAILED.
+    """
     store, run_id, outcome = _run_and_execute(
         tmp_path, "#!/bin/bash\necho out\necho boom >&2\nexit 3\n"
     )
     assert outcome.exit_code == 1
-    assert outcome.run_status == "FAILED"
+    assert outcome.run_status == "SUCCESS"
     assert outcome.batch_status == "failed"
     assert outcome.counts["failed"] == 1
     assert outcome.error_counts == {"exec_nonzero": 1}
@@ -293,7 +320,7 @@ def test_failure_execution_persisted(tmp_path: Path) -> None:
         ).fetchone()
         assert task["status"] == "FAILED"
         assert task["error_class"] == "exec_nonzero"
-    _assert_summary_persisted(store, run_id, "FAILED", "failed")
+    _assert_summary_persisted(store, run_id, "SUCCESS", "failed")
 
 
 def test_transient_error_retries_then_succeeds(tmp_path: Path, monkeypatch) -> None:
@@ -510,7 +537,9 @@ def test_cli_run_failure_exit_one(tmp_path: Path) -> None:
         )
     assert proc.returncode == 1, proc.stderr
     summary = json.loads(proc.stdout)
-    assert summary["payload"]["run_status"] == "FAILED"
+    assert summary["payload"]["run_status"] == "SUCCESS"
+    assert summary["payload"]["batch_status"] == "failed"
+    assert summary["payload"]["exit_code"] == 1
     assert summary["payload"]["counts"]["failed"] == 1
     assert summary["payload"]["error_counts"] == {"exec_nonzero": 1}
 
@@ -540,6 +569,32 @@ def test_cli_run_idempotency_reuses_run(tmp_path: Path) -> None:
     # Only one run exists in the database.
     with Database(tmp_path / "data" / "wft.db").connect_migrated() as conn:
         assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_cli_run_idempotency_reuse_returns_stored_exit_code(tmp_path: Path) -> None:
+    """Reuse reads the stored BatchSummary.exit_code, not Run=SUCCESS=>0."""
+    with ThreadedSSHServer(tmp_path) as server:
+        env = _cli_env(
+            tmp_path, server, script_body="#!/bin/bash\necho boom >&2\nexit 5\n"
+        )
+        argv = [
+            "run",
+            "--config", str(env["config"]),
+            "--inventory", str(env["inventory"]),
+            "--scripts", str(env["scripts"]),
+            "--script", "ok",
+            "--known-hosts", str(env["known_hosts"]),
+            "--idempotency-key", "k_cli_reuse_fail",
+            "--json",
+        ]
+        first = run_cli(*argv)
+        second = run_cli(*argv)
+    assert first.returncode == 1, first.stderr
+    # The stored summary says SUCCESS/failed => exit 1, even though Run=SUCCESS.
+    assert second.returncode == 1, second.stderr
+    payload = json.loads(second.stdout)
+    assert payload["payload"]["reused"] is True
+    assert payload["payload"]["run_status"] == "SUCCESS"
 
 
 def test_cli_run_idempotency_conflict_exit_two(tmp_path: Path) -> None:

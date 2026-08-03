@@ -152,7 +152,13 @@ def _reused_run(args: argparse.Namespace, store: Store, run_id: str) -> int:
     """AC-011: identical idempotency_key + params returns the original Run."""
     run = store.get_run(run_id) or {}
     status = run.get("status")
-    exit_code = EXIT_OK if status == "SUCCESS" else EXIT_BUSINESS
+    # The stored BatchSummary.exit_code is authoritative (a SUCCESS Run can be a
+    # failed batch => exit 1); fall back only when the Run has no summary yet.
+    summary = store.get_batch_summary(run_id)
+    if summary is not None:
+        exit_code = summary["exit_code"]
+    else:
+        exit_code = EXIT_OK if status == "SUCCESS" else EXIT_BUSINESS
     if args.json:
         emit_json(
             envelope("contract-01-envelope", {

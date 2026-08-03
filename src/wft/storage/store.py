@@ -387,6 +387,15 @@ class Store:
             "outbox_event_ids": event_ids,
         }
 
+    def get_batch_summary(self, run_id: str) -> dict | None:
+        """Return the stored Contract-05 payload for a Run, or None."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT summary_json FROM batch_summaries WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            return json.loads(row["summary_json"]) if row else None
+
 
 HEARTBEAT_SECONDS = 10
 LEASE_SECONDS = 60

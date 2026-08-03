@@ -205,7 +205,7 @@ async def execute_run(
     finished_at = now_iso()
     duration_ms = int((loop.time() - start) * 1000)
     run_status, batch_status = _batch_status(degraded, any_succeeded, any_failed)
-    exit_code = 0 if run_status == "SUCCESS" else 1
+    exit_code = _run_exit_code(run_status, batch_status)
 
     final_event_type, final_message = {
         "SUCCESS": ("run_completed", "run completed"),
@@ -331,14 +331,33 @@ def _attempt_record(
 
 
 def _batch_status(degraded: bool, any_succeeded: bool, any_failed: bool) -> tuple[str, str]:
-    """Map node outcomes to (run_status, batch_status) per 命令契约 §7."""
-    if any_failed and any_succeeded:
+    """Map trustworthy node outcomes to (run_status, batch_status) per 命令契约 §7.
+
+    ``run_status`` records whether the batch completed with trustworthy results.
+    Node-level FAILED outcomes (script non-zero, retries exhausted) are still
+    trustworthy, so an all-failed batch is ``SUCCESS``/``failed`` and a mixed
+    one is ``SUCCESS``/``partial``. Non-critical degradation (binary output,
+    etc.) is ``DEGRADED``. ``FAILED``/exit 2 is reserved for a batch with no
+    trustworthy result at all.
+    """
+    if degraded and any_failed:
         return "DEGRADED", "partial"
     if degraded:
-        return "DEGRADED", "partial"
-    if any_succeeded:
-        return "SUCCESS", "success"
-    return "FAILED", "failed"
+        return "DEGRADED", "success"
+    if any_failed and any_succeeded:
+        return "SUCCESS", "partial"
+    if any_failed:
+        return "SUCCESS", "failed"
+    return "SUCCESS", "success"
+
+
+def _run_exit_code(run_status: str, batch_status: str) -> int:
+    """CLI exit code per 命令契约 §7: 0=success, 1=partial/failed/degraded, 2=no trusted result."""
+    if run_status == "SUCCESS" and batch_status == "success":
+        return 0
+    if run_status == "FAILED":
+        return 2
+    return 1
 
 
 def build_batch_summary(
