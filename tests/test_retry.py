@@ -42,11 +42,12 @@ def test_transient_backoff_grows() -> None:
 
 
 def test_transient_backoff_jitter_bounds() -> None:
-    # Jitter scales each base by [0.5, 1.5] so retries do not pile up in lockstep.
+    # Jitter scales each base by [0.75, 1.25] (approved +/-25%) so retries do
+    # not pile up in lockstep.
     for retry in (1, 2, 3):
         base = 1.0 if retry <= 1 else 4.0
         value = backoff_seconds("conn_timeout", retry, jitter=True)
-        assert 0.5 * base <= value <= 1.5 * base
+        assert 0.75 * base <= value <= 1.25 * base
 
 
 def test_storage_backoff_is_short() -> None:

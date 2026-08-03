@@ -29,7 +29,7 @@ def should_retry(error_class: str, attempt_count: int) -> bool:
 
 
 def backoff_seconds(error_class: str, retry_number: int, *, jitter: bool = True) -> float:
-    """TRANSIENT retry backoff: 1s then 4s, each with +/-50% jitter.
+    """TRANSIENT retry backoff: 1s then 4s, each with +/-25% jitter.
 
     Storage-layer retries (``db_busy``/``db_write_failed``) keep a much shorter
     fixed backoff; the SSH layer never sees those classes. ``jitter=False`` is
@@ -40,4 +40,4 @@ def backoff_seconds(error_class: str, retry_number: int, *, jitter: bool = True)
     base = 1.0 if retry_number <= 1 else 4.0
     if not jitter:
         return base
-    return base * random.uniform(0.5, 1.5)
+    return base * random.uniform(0.75, 1.25)
