@@ -316,7 +316,7 @@ def _map_connection_error(exc: BaseException) -> dict:
         return error_dict("conn_timeout", str(exc))
     if isinstance(exc, socket.gaierror):
         return error_dict("dns_failed", str(exc))
-    if isinstance(exc, asyncssh.OSError) or isinstance(exc, OSError):
+    if isinstance(exc, OSError):
         cls = _errno_to_class(getattr(exc, "errno", None))
         return error_dict(cls, str(exc))
     if isinstance(exc, asyncssh.DisconnectError):

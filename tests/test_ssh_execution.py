@@ -6,6 +6,7 @@ drives the real ``execute_script`` chain against it.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -358,3 +359,71 @@ def test_exec_timeout_reaps_process_and_cleanup(tmp_path: Path) -> None:
             os.kill(pid, 0)
     assert not list(Path("/tmp").glob("wft-*.sh"))
     assert not list(Path("/tmp").glob("wft-*.done"))
+
+
+def test_conn_refused_maps_to_conn_refused(tmp_path: Path, monkeypatch) -> None:
+    # A refused connect (ConnectionRefusedError) must classify through the
+    # public execute_script() path as conn_refused/TRANSIENT/retryable, not
+    # blow up on the bogus asyncssh.OSError attribute check.
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    script = _script(script_path)
+
+    async def _refuse(**kwargs):
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+    async def _run(host, port, key_path, known_hosts_path):
+        monkeypatch.setattr(asyncssh, "connect", _refuse)
+        return await execute_script(
+            node=_node(host, port, key_path=key_path),
+            script=script,
+            known_hosts_path=known_hosts_path,
+            connect_timeout_sec=5,
+            exec_timeout_sec=2,
+        )
+
+    outcome = _run_server_and(_run, tmp_path)
+    assert outcome.error is not None
+    assert outcome.error["class"] == "conn_refused"
+    assert outcome.error["category"] == "TRANSIENT"
+    assert outcome.error["retryable"] is True
+
+
+def test_conn_reset_maps_to_conn_reset(tmp_path: Path) -> None:
+    # A real loopback TCP endpoint that accepts the connection and then closes
+    # it immediately, so the SSH handshake dies with ECONNRESET. The reset must
+    # classify through the production error path as conn_reset/TRANSIENT/
+    # retryable, and both the raw server and its sockets must be cleaned up.
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+
+    async def _accept_then_close(reader, writer):
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+    async def _run(host, port, key_path, known_hosts_path):
+        raw = await asyncio.start_server(_accept_then_close, "127.0.0.1", 0)
+        try:
+            reset_port = raw.sockets[0].getsockname()[1]
+            reset_known_hosts = tmp_path / "reset_known_hosts"
+            host_key = asyncssh.generate_private_key("ssh-ed25519")
+            _known_hosts(reset_known_hosts, "127.0.0.1", reset_port, host_key)
+            return await execute_script(
+                node=_node("127.0.0.1", reset_port, key_path=key_path),
+                script=_script(script_path),
+                known_hosts_path=reset_known_hosts,
+                connect_timeout_sec=5,
+                exec_timeout_sec=2,
+            )
+        finally:
+            raw.close()
+            await raw.wait_closed()
+
+    outcome = _run_server_and(_run, tmp_path)
+    assert outcome.error is not None
+    assert outcome.error["class"] == "conn_reset"
+    assert outcome.error["category"] == "TRANSIENT"
+    assert outcome.error["retryable"] is True
