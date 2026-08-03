@@ -62,4 +62,5 @@ jobs:
       - name: Dependency audit (fail closed)
         run: pip-audit .
       - name: Secret scan (full history, fail closed)
-        run: "$HOME/.local/bin/gitleaks" git --no-banner --redact --log-opts="--all"
+        run: |
+          "$HOME/.local/bin/gitleaks" git --no-banner --redact --log-opts="--all"
