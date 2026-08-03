@@ -4,12 +4,23 @@
 binding: no separate ``meta.schema_version`` row). ``synchronous=FULL`` is set
 uniformly for the kill -9 durability gate; WAL, ``foreign_keys=ON`` and a
 ``busy_timeout`` are configured in :class:`wft.storage.db.Database`.
+
+Each migration step runs in its own transaction and is all-or-nothing: a
+mid-step failure rolls back every DDL statement AND the ``user_version`` bump,
+so a partial schema can never be observed. A database at a *newer* version is
+rejected rather than downgraded.
 """
 from __future__ import annotations
 
 import sqlite3
 
+from wft.contracts.errors import WFTStorageError
+
 SCHEMA_VERSION = 1
+
+
+def _split_statements(ddl: str) -> tuple[str, ...]:
+    return tuple(s.strip() for s in ddl.split(";") if s.strip())
 
 _DDL_V1 = """
 CREATE TABLE runs (
@@ -115,9 +126,45 @@ CREATE INDEX idx_outbox_status ON outbox(status);
 """
 
 
+# target schema version -> ordered DDL statements. A step may only ADD structure;
+# ``PRAGMA user_version`` is bumped inside the same transaction as its DDL.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: _split_statements(_DDL_V1),
+}
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """Bring the schema up to ``SCHEMA_VERSION`` via ``PRAGMA user_version``."""
+    """Bring the schema up to ``SCHEMA_VERSION`` via ``PRAGMA user_version``.
+
+    Steps are applied strictly forward from the current version. Every step is
+    all-or-nothing (DDL + version bump in one transaction), so a crash or error
+    mid-way leaves both the schema and ``user_version`` exactly as they were.
+    A database already at a newer version is rejected: downgrading an unknown
+    schema could corrupt it, so it is safer to refuse than to guess.
+    """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version < 1:
-        conn.executescript(_DDL_V1)
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    if version > SCHEMA_VERSION:
+        raise WFTStorageError(
+            f"database schema is version {version}, newer than this build "
+            f"(max {SCHEMA_VERSION}); refusing to migrate/downgrade"
+        )
+    for target in range(version + 1, SCHEMA_VERSION + 1):
+        statements = _MIGRATIONS.get(target)
+        if statements is None:
+            raise WFTStorageError(f"no migration defined for schema version {target}")
+        _apply_migration(conn, target, statements)
+
+
+def _apply_migration(
+    conn: sqlite3.Connection, target: int, statements: tuple[str, ...]
+) -> None:
+    """Apply one step atomically: DDL and the ``user_version`` bump together."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {target}")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise

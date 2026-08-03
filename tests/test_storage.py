@@ -7,6 +7,7 @@ checkpoint, real outbox row and run event commit in ONE transaction
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from wft.storage.blobs import BlobStore
 from wft.storage.db import Database
 from wft.storage.schema import SCHEMA_VERSION, migrate
 from wft.storage.store import Store
+
+import wft.storage.schema as schema
 
 
 @pytest.fixture()
@@ -105,6 +108,71 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     migrate(conn)
     migrate(conn)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    conn.close()
+
+
+def test_migrate_from_empty_creates_schema(tmp_path: Path) -> None:
+    conn = Database(tmp_path / "wft.db").connect()
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    for table in ("runs", "node_tasks", "executions", "attempts",
+                  "run_events", "batch_summaries", "outbox"):
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None, table
+    conn.close()
+
+
+def test_migrate_rejects_newer_version(tmp_path: Path) -> None:
+    conn = Database(tmp_path / "wft.db").connect()
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    with pytest.raises(WFTStorageError, match="newer"):
+        migrate(conn)
+    # Refusal is read-only: the version is untouched.
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION + 1
+    conn.close()
+
+
+def test_migrate_steps_forward_from_old_version(tmp_path: Path, monkeypatch) -> None:
+    """A database created by an older release upgrades step by step."""
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(schema, "_MIGRATIONS", {
+        1: ("CREATE TABLE t1(x INTEGER)",),
+        2: ("CREATE TABLE t2(x INTEGER)",),
+        3: ("CREATE TABLE t3(x INTEGER)",),
+    })
+    db = Database(tmp_path / "wft.db")
+    conn = db.connect()
+    conn.execute("CREATE TABLE t1(x INTEGER)")
+    conn.execute("PRAGMA user_version = 1")
+    conn.close()
+
+    conn = db.connect()
+    migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    for table in ("t2", "t3"):
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name=?", (table,)
+        ).fetchone() is not None, table
+    conn.close()
+
+
+def test_migrate_mid_step_failure_advances_nothing(tmp_path: Path, monkeypatch) -> None:
+    """A step is all-or-nothing: a mid-step failure rolls back its DDL and
+    the user_version bump, so neither schema nor version moves forward."""
+    monkeypatch.setattr(schema, "_MIGRATIONS", {
+        1: (
+            "CREATE TABLE t_ok(x INTEGER)",
+            "CREATE TABLE t_broken(x INTEGER THIS IS NOT SQL)",
+        ),
+    })
+    conn = Database(tmp_path / "wft.db").connect()
+    with pytest.raises(sqlite3.OperationalError):
+        migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    # The earlier statement of the same step was rolled back with the failure.
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name='t_ok'").fetchone() is None
     conn.close()
 
 
