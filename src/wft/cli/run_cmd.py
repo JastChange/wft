@@ -83,6 +83,7 @@ def _run(args: argparse.Namespace) -> int:
     ensure_inventory_valid(payload, source=str(inventory_path), line_index=line_index)
     selected = select_nodes(payload.get("nodes", []), groups=args.group, tags=args.tag)
     require_targets(selected)
+    _reject_bastion(selected)
 
     scripts_path = Path(args.scripts) if args.scripts else (
         cfg.scripts_path if cfg.scripts_path else None
@@ -129,6 +130,22 @@ def _run(args: argparse.Namespace) -> int:
     )
     _report(args, outcome)
     return outcome.exit_code
+
+
+def _reject_bastion(nodes: list[dict]) -> None:
+    """Fail fast (exit 2) before Run creation when a target uses a bastion.
+
+    Bastion routing is a declared Phase 2 deviation: silently ignoring the field
+    would execute against the wrong path, so any selected bastion node is refused
+    rather than ignored (approved deviation: bastion deferred).
+    """
+    for node in nodes:
+        if node.get("bastion"):
+            raise WFTError(
+                f"node {node['node_id']!r} routes through bastion "
+                f"{node['bastion']!r}, which is not yet supported; "
+                "refusing to create a Run (exit 2)"
+            )
 
 
 def _default_limits(script) -> dict:

@@ -597,6 +597,52 @@ def test_cli_run_idempotency_reuse_returns_stored_exit_code(tmp_path: Path) -> N
     assert payload["payload"]["run_status"] == "SUCCESS"
 
 
+def test_cli_run_bastion_selected_is_config_error(tmp_path: Path) -> None:
+    """A selected bastion node fails fast (exit 2) before a Run is created."""
+    key_path = tmp_path / "clientkey"
+    key_path.write_text("placeholder", encoding="utf-8")
+    inventory = tmp_path / "inventory.yaml"
+    inventory.write_text(
+        "nodes:\n"
+        "  - node_id: jump-host\n"
+        "    host: 127.0.0.1\n"
+        "    port: 22\n"
+        "    username: tester\n"
+        "    auth:\n"
+        "      method: key\n"
+        f"      credential_ref: file://{key_path}\n"
+        "    groups: []\n"
+        "    tags: []\n"
+        "    enabled: true\n"
+        "  - node_id: node-a\n"
+        "    host: 10.0.0.11\n"
+        "    port: 22\n"
+        "    username: tester\n"
+        "    auth:\n"
+        "      method: key\n"
+        f"      credential_ref: file://{key_path}\n"
+        "    groups: [web]\n"
+        "    tags: []\n"
+        "    bastion: jump-host\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "wft.yaml"
+    config.write_text(f"data_dir: {tmp_path / 'data'}\n", encoding="utf-8")
+    proc = run_cli(
+        "run",
+        "--config", str(config),
+        "--inventory", str(inventory),
+        "--group", "web",
+        "--script", "ok",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "bastion" in proc.stderr.lower()
+    # No Run may be created before the fail-fast.
+    with Database(tmp_path / "data" / "wft.db").connect_migrated() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
 def test_cli_run_idempotency_conflict_exit_two(tmp_path: Path) -> None:
     with ThreadedSSHServer(tmp_path) as server:
         env = _cli_env(tmp_path, server)
