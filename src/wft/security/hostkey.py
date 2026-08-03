@@ -3,9 +3,16 @@
 AC-002 requires that fingerprints are shown to the operator, confirmed via a
 trusted channel, and only then written to ``known_hosts``. Unconfirmed
 fingerprints must never be written.
+
+``ssh-keyscan`` emits ``host algorithm <base64 key blob>`` lines. The key blob
+is what gets written to ``known_hosts``; the standard ``SHA256:...`` fingerprint
+(derived from the blob) is what an operator verifies through a trusted channel
+and what ``--accept`` compares against.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import shutil
 import subprocess
@@ -24,10 +31,21 @@ class DiscoveredKey:
     host: str
     port: int
     algorithm: str
-    fingerprint: str
+    key_blob: str
+
+    @property
+    def fingerprint(self) -> str:
+        return fingerprint_of(self.key_blob)
 
     def display(self) -> str:
         return f"{self.node_id}: {self.algorithm} {self.fingerprint}"
+
+
+def fingerprint_of(key_blob: str) -> str:
+    """Standard OpenSSH host-key fingerprint: ``SHA256:`` + b64(sha256(blob))."""
+    raw = base64.b64decode(key_blob + "=" * (-len(key_blob) % 4))
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
 
 
 def ssh_keyscan(host: str, port: int, timeout_sec: float = 5.0) -> list[str]:
@@ -43,7 +61,7 @@ def ssh_keyscan(host: str, port: int, timeout_sec: float = 5.0) -> list[str]:
 
 
 def parse_keyscan_lines(lines: list[str], *, node_id: str, host: str, port: int) -> list[DiscoveredKey]:
-    """Parse ``host algorithm fingerprint ...`` keyscan output lines."""
+    """Parse ``host algorithm <base64 key blob>`` keyscan output lines."""
     keys: list[DiscoveredKey] = []
     for line in lines:
         parts = line.split()
@@ -52,8 +70,8 @@ def parse_keyscan_lines(lines: list[str], *, node_id: str, host: str, port: int)
         if parts[0].startswith("#") or parts[0] == "@cert-authority":
             continue
         algo = parts[1]
-        fp = parts[2]
-        keys.append(DiscoveredKey(node_id=node_id, host=host, port=port, algorithm=algo, fingerprint=fp))
+        blob = parts[2]
+        keys.append(DiscoveredKey(node_id=node_id, host=host, port=port, algorithm=algo, key_blob=blob))
     return keys
 
 
@@ -85,12 +103,12 @@ def write_known_hosts_atomic(path: Path, lines: list[str]) -> None:
         raise
 
 
-def known_hosts_entry(host: str, port: int, algorithm: str, fingerprint: str) -> str:
+def known_hosts_entry(host: str, port: int, algorithm: str, key_blob: str) -> str:
     if port == 22:
         hostspec = host
     else:
         hostspec = f"[{host}]:{port}"
-    return f"{hostspec} {algorithm} {fingerprint}"
+    return f"{hostspec} {algorithm} {key_blob}"
 
 
 def commit_confirmed(
@@ -101,7 +119,7 @@ def commit_confirmed(
     if not confirmed:
         return []
     existing = read_known_hosts(path)
-    new_entries = [e for e in (known_hosts_entry(k.host, k.port, k.algorithm, k.fingerprint) for k in confirmed)
+    new_entries = [e for e in (known_hosts_entry(k.host, k.port, k.algorithm, k.key_blob) for k in confirmed)
                    if e not in existing]
     merged = existing + new_entries
     write_known_hosts_atomic(path, merged)

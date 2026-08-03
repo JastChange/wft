@@ -37,7 +37,7 @@ def handle_check(args: argparse.Namespace) -> int:
     scripts = [{"name": s.name, "sha256": s.sha256, "risk": s.risk, "display_ref": s.display_ref}
                for s in registry.scripts]
     if args.json:
-        emit_json(envelope("contract-12-script-registry", {
+        emit_json(envelope("contract-01-envelope", {
             "file": args.file,
             "valid": True,
             "scripts": scripts,
@@ -57,7 +57,7 @@ def handle_resolve(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_CONFIG
     if args.json:
-        emit_json(envelope("contract-12-script-registry", {
+        emit_json(envelope("contract-01-envelope", {
             "ref": args.ref,
             "script": {"name": script.name, "sha256": script.sha256, "path": str(script.path),
                        "risk": script.risk, "shell": script.shell, "timeout_sec": script.timeout_sec},

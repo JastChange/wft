@@ -1,7 +1,14 @@
-"""``wft hostkey onboard`` — discover and confirm host fingerprints (AC-002)."""
+"""``wft hostkey onboard`` — discover and confirm host fingerprints (AC-002).
+
+A fingerprint is confirmed only through a trusted channel: it must either be
+pre-approved via ``--accept node_id:algorithm:SHA256:...`` or explicitly
+confirmed in an interactive prompt after the operator has verified it. There is
+no bulk auto-accept flag. Unconfirmed fingerprints are never written.
+"""
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 from pathlib import Path
 
@@ -11,7 +18,7 @@ from wft.inventory.validate import ensure_inventory_valid
 from wft.observability.audit import AuditLog
 from wft.security import hostkey
 
-from .common import EXIT_CONFIG, EXIT_OK, emit_json, envelope
+from .common import EXIT_BUSINESS, EXIT_CONFIG, EXIT_OK, emit_json, envelope
 
 _HAS_PROMPT = sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -22,11 +29,11 @@ def add_parser(subparsers) -> None:
     onboard = sub.add_parser("onboard", help="discover and confirm host fingerprints")
     onboard.add_argument("--inventory", required=True, help="path to inventory YAML")
     onboard.add_argument("--node", action="append", default=[], help="only onboard these node_ids (repeatable)")
-    onboard.add_argument("--accept", action="append", default=[], help="pre-reviewed fingerprint (node_id:algo:fingerprint), repeatable")
+    onboard.add_argument("--accept", action="append", default=[],
+                         help="pre-reviewed fingerprint node_id:algorithm:SHA256:..., repeatable")
     onboard.add_argument("--known-hosts", help="known_hosts file to update (default: config or data/known_hosts)")
     onboard.add_argument("--timeout", type=float, default=5.0, help="ssh-keyscan timeout seconds")
     onboard.add_argument("--json", action="store_true", help="machine-readable output")
-    onboard.add_argument("--yes", action="store_true", help="accept all discovered fingerprints (explicit, audited)")
     onboard.set_defaults(handler=handle_onboard)
 
 
@@ -82,7 +89,7 @@ def handle_onboard(args: argparse.Namespace) -> int:
 
         for key in keys:
             print(key.display())
-            confirmed = _decide(key, pre_reviewed, args)
+            confirmed = _decide(key, pre_reviewed)
             if confirmed:
                 accepted.append(key)
             else:
@@ -112,17 +119,16 @@ def handle_onboard(args: argparse.Namespace) -> int:
         "known_hosts": str(known_hosts_path),
     }
     if args.json:
-        emit_json(envelope("contract-01-envelope", result, stage="security"))
+        emit_json(envelope("contract-01-envelope", result))
     else:
         print(f"confirmed {len(accepted)} fingerprint(s); wrote {len(written)} to {known_hosts_path}")
         for rej in rejected:
             print(f"  not written: {rej['node_id']} ({rej['reason']})")
-    return EXIT_OK
+    # Any discovery failure or unconfirmed fingerprint is a business result.
+    return EXIT_BUSINESS if rejected else EXIT_OK
 
 
 def _actor() -> str:
-    import getpass
-
     return getpass.getuser()
 
 
@@ -132,24 +138,26 @@ def _parse_accept(accept: list[str]) -> dict[tuple[str, str], str]:
     for item in accept:
         parts = item.split(":")
         if len(parts) < 3:
-            raise WFTInventoryError(f"--accept entry {item!r} must be node_id:algorithm:fingerprint")
+            raise WFTInventoryError(f"--accept entry {item!r} must be node_id:algorithm:SHA256:...")
         node_id, algo = parts[0], parts[1]
         fingerprint = ":".join(parts[2:])
         parsed[(node_id, algo)] = fingerprint
     return parsed
 
 
-def _decide(key: hostkey.DiscoveredKey, pre_reviewed: dict, args: argparse.Namespace) -> bool:
+def _decide(key: hostkey.DiscoveredKey, pre_reviewed: dict) -> bool:
+    """Confirm only when the fingerprint was verified through a trusted channel."""
     reviewed = pre_reviewed.get((key.node_id, key.algorithm))
     if reviewed is not None:
         return reviewed == key.fingerprint
-    if args.yes:
-        return True
     if not _HAS_PROMPT:
         print(
-            f"  [{key.node_id}] not in --accept and no TTY; refusing to auto-accept",
+            f"  [{key.node_id}] fingerprint not in --accept and no TTY; refusing to auto-accept",
             file=sys.stderr,
         )
         return False
-    answer = input(f"  confirm {key.algorithm} fingerprint for {key.node_id}? [y/N] ").strip().lower()
+    answer = input(
+        f"  confirm {key.algorithm} fingerprint {key.fingerprint} for {key.node_id} "
+        "after verifying it via a trusted channel? [y/N] "
+    ).strip().lower()
     return answer in ("y", "yes")

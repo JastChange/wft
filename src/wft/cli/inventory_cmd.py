@@ -32,7 +32,7 @@ def handle_check(args: argparse.Namespace) -> int:
     if problems:
         print_errors(problems)
         if args.json:
-            emit_json(envelope("contract-11-inventory", {
+            emit_json(envelope("contract-01-envelope", {
                 "file": str(path),
                 "valid": False,
                 "errors": problems,
@@ -41,7 +41,7 @@ def handle_check(args: argparse.Namespace) -> int:
 
     count = len(payload.get("nodes", []))
     if args.json:
-        emit_json(envelope("contract-11-inventory", {
+        emit_json(envelope("contract-01-envelope", {
             "file": str(path),
             "valid": True,
             "node_count": count,

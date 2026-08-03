@@ -48,14 +48,14 @@ def test_bad_credential_scheme_detected() -> None:
 
 def test_inline_secret_body_detected() -> None:
     problems = validate_inventory_payload(
-        payload(node("node-a", auth={"method": "key", "credential_ref": "env://-----BEGIN OPENSSH PRIVATE KEY-----"}))
+        payload(node("node-a", auth={"method": "key", "credential_ref": "op://item/field -----BEGIN OPENSSH PRIVATE KEY-----"}))
     )
     assert any("inline secret" in p for p in problems)
 
 
 def test_inline_secret_body_with_whitespace_detected() -> None:
     problems = validate_inventory_payload(
-        payload(node("node-a", auth={"method": "key", "credential_ref": "env://hunter2 password"}))
+        payload(node("node-a", auth={"method": "key", "credential_ref": "op://item/field hunter2 password"}))
     )
     assert any("inline secret" in p for p in problems)
 
@@ -67,10 +67,36 @@ def test_inline_secret_body_no_scheme_is_scheme_error() -> None:
     assert any("not a recognised reference" in p for p in problems)
 
 
-@pytest.mark.parametrize("ref", ["env://WFT_KEY_A", "file:///etc/wft/keys/a.key", "vault://wft/nodes/a"])
+@pytest.mark.parametrize("ref", [
+    "env://WFT_KEY_A", "file:///etc/wft/keys/a.key", "vault://wft/nodes/a",
+    "op://vault/item/field", "agent://ssh-agent",
+])
 def test_legitimate_credential_refs_allowed(ref: str) -> None:
     problems = validate_inventory_payload(payload(node("node-a", auth={"method": "key", "credential_ref": ref})))
     assert problems == []
+
+
+@pytest.mark.parametrize("ref", [
+    "env://hunter2",      # lowercase password-looking value, not an UPPER_SNAKE ref
+    "env://1BAD",         # cannot start with a digit
+    "env://MY.KEY",       # dot is not valid in an env var name
+    "env://MY KEY",       # whitespace
+])
+def test_env_ref_must_be_upper_snake_name(ref: str) -> None:
+    problems = validate_inventory_payload(payload(node("node-a", auth={"method": "key", "credential_ref": ref})))
+    assert any("environment-variable reference" in p for p in problems)
+
+
+@pytest.mark.parametrize("ref", ["file://relative/path", "file://etc/wft/key"])
+def test_file_ref_must_be_absolute(ref: str) -> None:
+    problems = validate_inventory_payload(payload(node("node-a", auth={"method": "key", "credential_ref": ref})))
+    assert any("absolute path" in p for p in problems)
+
+
+@pytest.mark.parametrize("ref", ["vault://", "op://", "agent://"])
+def test_empty_reference_body_rejected(ref: str) -> None:
+    problems = validate_inventory_payload(payload(node("node-a", auth={"method": "key", "credential_ref": ref})))
+    assert problems  # empty body must never be accepted as a reference
 
 
 def test_missing_bastion_detected() -> None:

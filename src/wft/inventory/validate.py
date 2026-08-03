@@ -10,12 +10,18 @@ Semantic checks layered on top of the schema:
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from wft.contracts import registry
 from wft.contracts.errors import WFTInventoryError
 
 _CREDENTIAL_SCHEMES = ("env://", "vault://", "op://", "agent://", "file://")
+
+# env:// refs follow the UPPER_SNAKE convention (e.g. WFT_KEY_NODE_A); a bare
+# lowercase token such as "hunter2" is treated as an inline secret, not a ref.
+_ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def validate_inventory_payload(payload: dict, *, line_index: dict | None = None) -> list[str]:
@@ -53,16 +59,20 @@ def validate_inventory_payload(payload: dict, *, line_index: dict | None = None)
 
         auth = node.get("auth")
         if isinstance(auth, dict) and isinstance(auth.get("credential_ref"), str):
+            line = line_index.get(("nodes", i, "auth", "credential_ref"))
             ref = auth["credential_ref"]
+            scheme = ref.split("://", 1)[0] if "://" in ref else ""
             if not any(ref.startswith(s) for s in _CREDENTIAL_SCHEMES):
-                line = line_index.get(("nodes", i, "auth", "credential_ref"))
                 problems.append(
                     f"nodes[{i}] auth.credential_ref {ref!r} is not a recognised "
                     f"reference (allowed schemes: {', '.join(_CREDENTIAL_SCHEMES)})"
                     + (f" at line {line}" if line else "")
                 )
+                continue
+            semantics = _reference_semantics_error(scheme, ref.split("://", 1)[1])
+            if semantics:
+                problems.append(f"nodes[{i}] auth.credential_ref: {semantics}" + (f" at line {line}" if line else ""))
             elif _looks_like_secret_body(ref):
-                line = line_index.get(("nodes", i, "auth", "credential_ref"))
                 problems.append(
                     f"nodes[{i}] auth.credential_ref looks like an inline secret "
                     "body; use a credential reference only"
@@ -103,6 +113,30 @@ def _looks_like_secret_body(ref: str) -> bool:
     # A reference is a path/name (env var, vault path, file path, op ref). Any
     # character outside that set (e.g. a pasted password or base64 blob) is suspect.
     return not body or not all(c in _REFERENCE_CHARS for c in body)
+
+
+def _reference_semantics_error(scheme: str, body: str) -> str | None:
+    """Per-scheme semantic validation of the reference body; None when valid."""
+    if scheme == "env":
+        if not _ENV_NAME_RE.match(body):
+            return (
+                f"env://{body!r} is not a valid environment-variable reference; "
+                "expected an UPPER_SNAKE name such as WFT_KEY_NODE_A"
+            )
+        return None
+    if scheme == "file":
+        if not body.startswith("/") or " " in body:
+            return f"file://{body!r} must be an absolute path to a key file"
+        return None
+    if scheme == "agent":
+        if not _AGENT_NAME_RE.match(body):
+            return f"agent://{body!r} must be a plain agent name such as ssh-agent"
+        return None
+    if scheme in ("vault", "op"):
+        if not body:
+            return f"{scheme}:// must reference a non-empty path"
+        return None
+    return None
 
 
 def _check_bastions(nodes: list, problems: list[str]) -> None:

@@ -4,8 +4,8 @@
 节点执行**只读**巡检脚本；自动识别异常，生成规则/AI 摘要，把历史结果保存
 在 SQLite，并单向导出到本机 Obsidian Vault；异常批次发送 webhook 通知。
 
-> 规格基线：`SPEC_BASELINE_v1.0.md`（Approved for Implementation）。
-> 本文对应实现交接清单 Phase 0–1。
+> 规格基线：`docs/spec/SPEC_BASELINE_v1.0.md`（Approved for Implementation）。
+> 实现交接清单：`docs/spec/IMPLEMENTATION_HANDOFF_v1.0.md`（Phase 0–1）。
 
 ## 当前阶段（Phase 0–1）
 
@@ -41,6 +41,7 @@ pytest
 ```text
 contracts/      # 12 份 JSON Schema（权威副本）
 config/         # 示例配置（仅假节点 / 假凭据引用）
+docs/spec/      # 已批准规格基线 + 实现交接清单（SSOT）
 scripts/        # 示例只读巡检脚本
 src/wft/        # Python 包
 tests/          # 单测与契约样本

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from wft.cli.main import build_parser, main
-from wft.cli.common import EXIT_CONFIG, EXIT_OK
+from wft.cli.common import EXIT_BUSINESS, EXIT_CONFIG, EXIT_OK
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_EXAMPLE = REPO_ROOT / "config" / "inventory.example.yaml"
@@ -80,19 +80,38 @@ def test_not_implemented_command_returns_2() -> None:
         assert "not implemented" in proc.stderr
 
 
+def _assert_contract01_valid(payload: dict) -> None:
+    from wft.contracts import validate as cv
+
+    problems = cv.validate_contract_all("contract-01-envelope", payload)
+    assert not problems, f"JSON output violates Contract-01: {problems}"
+    assert payload["meta"]["schema_name"] == "contract-01-envelope"
+
+
 def test_not_implemented_json_output() -> None:
     proc = run_cli("run", "--json")
     assert proc.returncode == EXIT_CONFIG
     payload = json.loads(proc.stdout)
-    assert payload["meta"]["schema_name"] == "contract-01-envelope"
+    _assert_contract01_valid(payload)
     assert payload["payload"]["available"] is False
 
 
 def test_inventory_check_json_output() -> None:
     proc = run_cli("inventory", "check", "--file", str(INVENTORY_EXAMPLE), "--json")
     assert proc.returncode == EXIT_OK
-    payload = json.loads(proc.stdout)
-    assert payload["meta"]["schema_name"] == "contract-11-inventory"
+    _assert_contract01_valid(json.loads(proc.stdout))
+
+
+def test_script_check_json_output() -> None:
+    proc = run_cli("script", "check", "--file", str(SCRIPTS_EXAMPLE), "--json")
+    assert proc.returncode == EXIT_OK
+    _assert_contract01_valid(json.loads(proc.stdout))
+
+
+def test_script_resolve_json_output() -> None:
+    proc = run_cli("script", "resolve", "--file", str(SCRIPTS_EXAMPLE), "--ref", "disk-usage", "--json")
+    assert proc.returncode == EXIT_OK
+    _assert_contract01_valid(json.loads(proc.stdout))
 
 
 def test_main_no_args_prints_help() -> None:
@@ -104,40 +123,75 @@ def test_main_no_args_prints_help() -> None:
 
 
 def test_hostkey_decide_refuses_unconfirmed_without_tty() -> None:
-    """Without --accept/--yes and without a TTY, a fingerprint must not be accepted."""
+    """Without --accept and without a TTY, a fingerprint must not be accepted."""
     from wft.cli import hostkey_cmd
     from wft.security.hostkey import DiscoveredKey
 
-    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", fingerprint="AAAA")
-    args = argparse.Namespace(yes=False)
-    assert hostkey_cmd._decide(key, {}, args) is False
+    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", key_blob="AAAA")
+    assert hostkey_cmd._decide(key, {}) is False
 
 
 def test_hostkey_decide_accepts_pre_reviewed() -> None:
     from wft.cli import hostkey_cmd
-    from wft.security.hostkey import DiscoveredKey
+    from wft.security.hostkey import DiscoveredKey, fingerprint_of
 
-    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", fingerprint="AAAA")
-    args = argparse.Namespace(yes=False)
-    reviewed = {("node-a", "ssh-ed25519"): "AAAA"}
-    assert hostkey_cmd._decide(key, reviewed, args) is True
-    wrong = {("node-a", "ssh-ed25519"): "BBBB"}
-    assert hostkey_cmd._decide(key, wrong, args) is False
-
-
-def test_hostkey_decide_yes_flag() -> None:
-    from wft.cli import hostkey_cmd
-    from wft.security.hostkey import DiscoveredKey
-
-    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", fingerprint="AAAA")
-    args = argparse.Namespace(yes=True)
-    assert hostkey_cmd._decide(key, {}, args) is True
+    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", key_blob="AAAA")
+    reviewed = {("node-a", "ssh-ed25519"): key.fingerprint}
+    assert hostkey_cmd._decide(key, reviewed) is True
+    wrong = {("node-a", "ssh-ed25519"): fingerprint_of("BBBB")}
+    assert hostkey_cmd._decide(key, wrong) is False
 
 
 def test_hostkey_parse_accept() -> None:
     from wft.cli import hostkey_cmd
 
-    parsed = hostkey_cmd._parse_accept(["node-a:ssh-ed25519:AAA:BB", "node-b:ssh-rsa:CC"])
-    assert parsed == {("node-a", "ssh-ed25519"): "AAA:BB", ("node-b", "ssh-rsa"): "CC"}
+    parsed = hostkey_cmd._parse_accept(["node-a:ssh-ed25519:SHA256:AAA:BB", "node-b:ssh-rsa:SHA256:CC"])
+    assert parsed == {("node-a", "ssh-ed25519"): "SHA256:AAA:BB", ("node-b", "ssh-rsa"): "SHA256:CC"}
     with pytest.raises(Exception):
         hostkey_cmd._parse_accept(["node-a:ssh-ed25519"])
+
+
+def test_hostkey_onboard_returns_business_on_discovery_failure(monkeypatch, tmp_path) -> None:
+    """Any discovery failure or unconfirmed fingerprint => exit 1 (命令契约 §7)."""
+    from wft.cli import hostkey_cmd
+    from wft.contracts.errors import WFTError
+
+    def fake_discover(host, port, node_id, *, timeout_sec=5.0):
+        raise WFTError("connection refused")
+
+    monkeypatch.setattr(hostkey_cmd.hostkey, "discover", fake_discover)
+    args = build_parser().parse_args([
+        "hostkey", "onboard", "--inventory", str(INVENTORY_EXAMPLE),
+        "--known-hosts", str(tmp_path / "known_hosts"),
+    ])
+    assert hostkey_cmd.handle_onboard(args) == EXIT_BUSINESS
+
+
+def test_hostkey_onboard_returns_ok_when_all_confirmed(monkeypatch, tmp_path) -> None:
+    from wft.cli import hostkey_cmd
+    from wft.security.hostkey import DiscoveredKey
+
+    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", key_blob="AAAABLOB")
+
+    def fake_discover(host, port, node_id, *, timeout_sec=5.0):
+        return [key]
+
+    monkeypatch.setattr(hostkey_cmd.hostkey, "discover", fake_discover)
+    args = build_parser().parse_args([
+        "hostkey", "onboard", "--inventory", str(INVENTORY_EXAMPLE), "--node", "node-a",
+        "--accept", f"node-a:ssh-ed25519:{key.fingerprint}",
+        "--known-hosts", str(tmp_path / "known_hosts"),
+    ])
+    assert hostkey_cmd.handle_onboard(args) == EXIT_OK
+    written = (tmp_path / "known_hosts").read_text(encoding="utf-8")
+    assert "ssh-ed25519 AAAABLOB" in written
+
+
+def test_hostkey_onboard_config_error_is_two(monkeypatch, tmp_path) -> None:
+    """Missing inventory / bad node filter => exit 2."""
+    from wft.cli import hostkey_cmd
+
+    args = build_parser().parse_args([
+        "hostkey", "onboard", "--inventory", str(tmp_path / "missing.yaml"),
+    ])
+    assert hostkey_cmd.handle_onboard(args) == EXIT_CONFIG
