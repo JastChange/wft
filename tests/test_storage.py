@@ -17,6 +17,7 @@ from wft.contracts.errors import (
     WFTLeaseLostError,
     WFTStorageError,
 )
+from wft.idgen import new_uuid7
 from wft.storage.blobs import BlobStore
 from wft.storage.db import Database
 from wft.storage.schema import SCHEMA_VERSION, migrate
@@ -282,40 +283,56 @@ def test_renew_lease_lost_returns_false(store: Store) -> None:
     assert store.renew_lease(rid, lease_owner="intruder") is False
 
 
-def test_acquire_resume_lock_requires_stale_heartbeat(store: Store) -> None:
-    rid = "01HX0" + "A" * 21
-    store.create_run(_run_spec(rid))
-    store.start_run(rid, lease_owner="worker-1")
-    # Heartbeat is fresh; resume must not succeed.
-    assert store.acquire_resume_lock(rid, lease_owner="worker-2") is False
-
-
-def test_acquire_resume_lock_stale_gate_is_lease_seconds(store: Store) -> None:
-    """Heartbeat renews every 10s but the stale gate is the full 60s lease."""
+def _make_stale(store: Store, rid: str, seconds_ago: int) -> None:
     from datetime import datetime, timedelta, timezone
 
+    past = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+    conn = store.database.connect()
+    conn.execute(
+        "UPDATE runs SET heartbeat_at=?, lease_expires_at=? WHERE run_id=?",
+        (past, past, rid),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _resume(store: Store, rid: str, owner: str) -> list[dict] | None:
+    return store.resume_run(
+        rid,
+        lease_owner=owner,
+        run_audit_event=build_event(rid, "checkpoint_updated", f"run resumed by {owner}"),
+        node_checkpoint_factory=lambda nid, uid: build_event(
+            rid, "checkpoint_updated", f"node {nid} checkpoint -> UNKNOWN (resume)",
+            node_id=nid, execution_uid=uid,
+        ),
+    )
+
+
+def test_resume_run_requires_stale_heartbeat(store: Store) -> None:
     rid = "01HX0" + "A" * 21
     store.create_run(_run_spec(rid))
     store.start_run(rid, lease_owner="worker-1")
-    now = datetime.now(timezone.utc)
+    # Heartbeat is fresh; the stale CAS must refuse with no state change.
+    assert _resume(store, rid, "worker-2") is None
+    run = store.get_run(rid)
+    assert run["lease_owner"] == "worker-1"
+    assert run["resume_count"] == 0
 
-    def _age(seconds_ago: int) -> None:
-        past = (now - timedelta(seconds=seconds_ago)).isoformat()
-        conn = store.database.connect()
-        conn.execute(
-            "UPDATE runs SET heartbeat_at=?, lease_expires_at=? WHERE run_id=?",
-            (past, past, rid),
-        )
-        conn.commit()
-        conn.close()
 
+def test_resume_run_stale_gate_is_lease_seconds(store: Store) -> None:
+    """Heartbeat renews every 10s but the stale gate is the full 60s lease."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.start_run(rid, lease_owner="worker-1")
     # 30s-old heartbeat is within the 60s gate: still owned by worker-1.
-    _age(30)
-    assert store.acquire_resume_lock(rid, lease_owner="worker-2") is False
+    _make_stale(store, rid, 30)
+    assert _resume(store, rid, "worker-2") is None
     # 90s-old heartbeat + lapsed lease: resumable via the CAS.
-    _age(90)
-    assert store.acquire_resume_lock(rid, lease_owner="worker-2") is True
-    assert store.get_run(rid)["lease_owner"] == "worker-2"
+    _make_stale(store, rid, 90)
+    assert _resume(store, rid, "worker-2") == []
+    run = store.get_run(rid)
+    assert run["lease_owner"] == "worker-2"
+    assert run["resume_count"] == 1
 
 
 # ----------------------------------------------------- audit (same transaction)
@@ -346,26 +363,31 @@ def test_start_run_audit_persisted_in_same_tx(store: Store) -> None:
     assert _event_types(store, rid) == ["run_started"]
 
 
-def test_resume_audit_persisted_in_same_tx(tmp_path: Path) -> None:
+def test_resume_audit_and_checkpoints_in_same_tx(tmp_path: Path) -> None:
+    """The recovery transaction flips RUNNING checkpoints to UNKNOWN (keeping
+    their execution_uid) with a per-node checkpoint_updated event each, while
+    PENDING and terminal checkpoints stay untouched -- all in one transaction
+    with the run-level resume audit."""
     from datetime import datetime, timedelta, timezone
 
     store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
     rid = "01HX0" + "A" * 21
-    store.create_run(_run_spec(rid))
+    store.create_run(_run_spec(rid), node_ids=["n1", "n2", "n3"])
     store.start_run(rid, lease_owner="worker-1")
-    past = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    conn = store.database.connect()
-    conn.execute(
-        "UPDATE runs SET heartbeat_at=?, lease_expires_at=? WHERE run_id=?",
-        (past, past, rid),
-    )
-    conn.commit()
-    conn.close()
-    assert store.acquire_resume_lock(
-        rid, lease_owner="worker-2",
-        audit_event=build_event(rid, "checkpoint_updated", "run resumed by worker-2"),
-    ) is True
-    assert _event_types(store, rid) == ["checkpoint_updated"]
+    # n1 RUNNING with a minted execution_uid; n2 still PENDING; n3 terminal.
+    uid = new_uuid7()
+    assert store.set_node_task(rid, "n1", "RUNNING", execution_uid=uid)
+    assert store.set_node_task(rid, "n3", "SUCCEEDED", execution_uid=new_uuid7())
+    _make_stale(store, rid, 90)
+    recovered = _resume(store, rid, "worker-2")
+    assert recovered == [{"node_id": "n1", "execution_uid": uid}]
+    tasks = {t["node_id"]: t for t in store.get_node_tasks(rid)}
+    assert tasks["n1"]["status"] == "UNKNOWN"
+    assert tasks["n1"]["execution_uid"] == uid  # preserved for re-dispatch
+    assert tasks["n2"]["status"] == "PENDING"  # preserved untouched
+    assert tasks["n3"]["status"] == "SUCCEEDED"  # terminal never touched
+    # Run-level resume audit + one per-node checkpoint_updated event.
+    assert _event_types(store, rid) == ["checkpoint_updated", "checkpoint_updated"]
 
 
 def test_start_run_audit_failure_rolls_back_state(tmp_path: Path, monkeypatch) -> None:

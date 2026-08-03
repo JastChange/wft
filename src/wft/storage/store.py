@@ -210,21 +210,52 @@ class Store:
             )
             return cur.rowcount == 1
 
-    def acquire_resume_lock(
-        self, run_id: str, *, lease_owner: str, audit_event: dict | None = None
-    ) -> bool:
-        """Single-CAS resume: Run=RUNNING, heartbeat stale, lease expired.
+    def is_resume_eligible(self, run: dict) -> bool:
+        """True when a RUNNING run may be resumed (heartbeat stale, lease expired).
 
         The heartbeat is renewed every ``HEARTBEAT_SECONDS`` but the stale gate
         is the full ``LEASE_SECONDS``: a worker only reclaims a Run whose lease
-        has actually lapsed, never one that is merely slow to heartbeat.
-        When the reclaim applies, ``audit_event`` (a Contract-09 envelope) is
-        written in the same transaction as the lease/checkpoint update, so a
-        resume can never be audited without its state change or vice versa.
+        has actually lapsed, never one that is merely slow to heartbeat. This is
+        a read-only pre-check; the authoritative gate is the ``resume_run`` CAS.
+        """
+        if run.get("status") != "RUNNING":
+            return False
+        now = now_iso()
+        stale_before = _add_seconds(now, -LEASE_SECONDS)
+        heartbeat = run.get("heartbeat_at")
+        lease = run.get("lease_expires_at")
+        heartbeat_stale = heartbeat is None or heartbeat < stale_before
+        lease_expired = lease is None or lease < now
+        return heartbeat_stale and lease_expired
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        lease_owner: str,
+        run_audit_event: dict,
+        node_checkpoint_factory,
+    ) -> list[dict] | None:
+        """Single recovery transaction: stale CAS + new owner + RUNNING->UNKNOWN.
+
+        The stale three-condition CAS (Run=RUNNING, heartbeat stale, lease
+        expired) must pass before anything is written; when it fails the whole
+        transaction returns None and no state changes (no new owner, no
+        ``resume_count`` bump, no events). On success the run gets the new
+        ``lease_owner``/heartbeat/expiry, ``resume_count`` is incremented, the
+        run-level ``run_audit_event`` (a Contract-09 envelope) lands, every
+        original RUNNING checkpoint is flipped to UNKNOWN -- preserving its
+        ``execution_uid`` -- and each flip writes its own Contract-09
+        ``checkpoint_updated`` event via ``node_checkpoint_factory``, all in the
+        SAME transaction. PENDING checkpoints are preserved untouched and
+        terminal (SUCCEEDED/FAILED/CANCELLED/SKIPPED) checkpoints are never
+        touched. Returns the recovered ``[{node_id, execution_uid}]`` rows, or
+        None when the CAS did not apply.
         """
         now = now_iso()
         stale_before = _add_seconds(now, -LEASE_SECONDS)
         lease_expires = _add_seconds(now, LEASE_SECONDS)
+        recovered: list[dict] = []
         with self.transaction() as conn:
             cur = conn.execute(
                 "UPDATE runs SET heartbeat_at=?, lease_owner=?, lease_expires_at=?, "
@@ -234,9 +265,26 @@ class Store:
                 "AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
                 (now, lease_owner, lease_expires, now, run_id, stale_before, now),
             )
-            if cur.rowcount == 1 and audit_event is not None:
-                self._insert_event(conn, run_id, audit_event)
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                return None
+            self._insert_event(conn, run_id, run_audit_event)
+            rows = conn.execute(
+                "SELECT node_id, execution_uid FROM node_tasks "
+                "WHERE run_id=? AND status='RUNNING' ORDER BY node_id",
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE node_tasks SET status='UNKNOWN', updated_at=? "
+                    "WHERE run_id=? AND node_id=?",
+                    (now, run_id, row["node_id"]),
+                )
+                event = node_checkpoint_factory(row["node_id"], row["execution_uid"])
+                self._insert_event(conn, run_id, event)
+                recovered.append(
+                    {"node_id": row["node_id"], "execution_uid": row["execution_uid"]}
+                )
+        return recovered
 
     def release_lease(self, run_id: str, lease_owner: str) -> None:
         now = now_iso()
@@ -261,7 +309,9 @@ class Store:
         """Transition a node task under CAS; False when the rewrite is illegal.
 
         Terminal statuses may never be rewritten and RUNNING may only follow a
-        non-terminal state, so a finished node cannot be silently re-flagged.
+        writable non-terminal state (PENDING/RUNNING/UNKNOWN), so a finished
+        node cannot be silently re-flagged and a resumed node (UNKNOWN, from
+        ``resume_run``) can be re-dispatched.
         When ``lease_owner`` is given, the checkpoint is fenced: the update only
         applies while the run is RUNNING, its current lease owner matches and
         the lease is unexpired. A checkpoint attempted by an owner who lost the
@@ -280,22 +330,26 @@ class Store:
             if lease_owner is not None:
                 self._assert_lease_owner(conn, run_id, lease_owner)
             if status in ("RUNNING",):
+                # A resumed node is re-dispatched from UNKNOWN (its checkpoint was
+                # flipped by ``resume_run``) and keeps the original execution_uid,
+                # so UNKNOWN is writable again; terminal statuses never are.
                 cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, "
                     "started_at=COALESCE(started_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')"
+                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING','UNKNOWN')"
                     + (fence if lease_owner is not None else ""),
                     (status, execution_uid, now, now, run_id, node_id)
                     + (() if lease_owner is None else (run_id, lease_owner, now)),
                 )
             else:
                 # A terminal status may only be set from a writable
-                # (PENDING/RUNNING) task; a finished node can never be re-flagged,
-                # even to the same status with a different execution_uid.
+                # (PENDING/RUNNING/UNKNOWN) task; a finished node can never be
+                # re-flagged, even to the same status with a different
+                # execution_uid.
                 cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
                     "finished_at=COALESCE(finished_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')"
+                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING','UNKNOWN')"
                     + (fence if lease_owner is not None else ""),
                     (status, execution_uid, error_class, now, now, run_id, node_id)
                     + (() if lease_owner is None else (run_id, lease_owner, now)),
@@ -303,6 +357,101 @@ class Store:
             if cur.rowcount == 1 and event is not None:
                 self._insert_event(conn, run_id, event)
             return cur.rowcount == 1
+
+    # ------------------------------------------------- attempts (durable)
+
+    def record_attempt(
+        self,
+        run_id: str,
+        node_id: str,
+        execution_uid: str,
+        *,
+        attempt_id: str,
+        attempt_seq: int,
+        status: str,
+        started_at: str,
+        finished_at: str | None = None,
+        error: dict | None = None,
+        lease_owner: str | None = None,
+    ) -> None:
+        """Durably persist one SSH attempt (start or final) under the lease fence.
+
+        Each attempt is written as it happens: ``status='RUNNING'`` with
+        ``finished_at=NULL`` before the SSH call, then updated to its final
+        status/error/``finished_at`` after it. A kill -9 therefore leaves a
+        durable per-attempt record and a resume continues from
+        ``max(attempt_seq)+1``. The upsert keys on ``(execution_uid,
+        attempt_id)`` so start and final writes share one row and no attempt_id
+        is ever duplicated. ``lease_owner`` fences the write: an owner who lost
+        the lease (a resumer took it) raises :class:`WFTLeaseLostError` instead
+        of corrupting the resumer's attempt sequence.
+        """
+        with self.transaction() as conn:
+            self._assert_lease_owner(conn, run_id, lease_owner)
+            conn.execute(
+                "INSERT INTO attempts (execution_uid, attempt_id, attempt_seq, status, "
+                "error_class, error_category, error_message, retryable, started_at, "
+                "finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(execution_uid, attempt_id) DO UPDATE SET "
+                "status=excluded.status, error_class=excluded.error_class, "
+                "error_category=excluded.error_category, "
+                "error_message=excluded.error_message, retryable=excluded.retryable, "
+                "finished_at=excluded.finished_at",
+                (
+                    execution_uid, attempt_id, attempt_seq, status,
+                    (error or {}).get("class"), (error or {}).get("category"),
+                    (error or {}).get("message"),
+                    int(bool((error or {}).get("retryable"))),
+                    started_at, finished_at,
+                ),
+            )
+
+    def get_attempt_max_seq(self, execution_uid: str) -> int:
+        """Return the highest persisted ``attempt_seq`` for an execution (0 when none)."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(attempt_seq), 0) AS m "
+                "FROM attempts WHERE execution_uid=?",
+                (execution_uid,),
+            ).fetchone()
+            return int(row["m"])
+
+    def get_last_attempt(self, execution_uid: str) -> dict | None:
+        """Return the highest-seq attempt row for an execution, or None."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM attempts WHERE execution_uid=? "
+                "ORDER BY attempt_seq DESC LIMIT 1",
+                (execution_uid,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_first_attempt_started(self, execution_uid: str) -> str | None:
+        """Return the started_at of the lowest-seq attempt, or None."""
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT started_at FROM attempts WHERE execution_uid=? "
+                "ORDER BY attempt_seq ASC LIMIT 1",
+                (execution_uid,),
+            ).fetchone()
+            return row["started_at"] if row else None
+
+    def get_node_finished_data_map(self, run_id: str) -> dict[str, dict]:
+        """Map node_id -> the node_finished event data for a run.
+
+        The node_finished event data carries per-node aggregation evidence
+        (``secondary_errors``: blob/decode errors that could not fit the single
+        Contract-03 error slot). A resume finalize reconstructs already-terminal
+        nodes' aggregate contribution from these events without re-running them.
+        """
+        with self.transaction() as conn:
+            rows = conn.execute(
+                "SELECT node_id, data_json FROM run_events "
+                "WHERE run_id=? AND event_type='node_finished'",
+                (run_id,),
+            ).fetchall()
+        return {r["node_id"]: json.loads(r["data_json"]) for r in rows}
 
     # --------------------------------------------------- node result commit
 
@@ -374,8 +523,12 @@ class Store:
                 ),
             )
             for attempt in attempts or ():
+                # Attempts are already durably persisted as they happen
+                # (``record_attempt``), so a replayed/retried commit must not
+                # collide on (execution_uid, attempt_id): OR IGNORE keeps the
+                # original per-attempt row and only adds rows not yet persisted.
                 conn.execute(
-                    "INSERT INTO attempts "
+                    "INSERT OR IGNORE INTO attempts "
                     "(execution_uid, attempt_id, attempt_seq, status, error_class, "
                     "error_category, error_message, retryable, started_at, finished_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -408,7 +561,7 @@ class Store:
             cur = conn.execute(
                 "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
                 "finished_at=?, updated_at=? WHERE run_id=? AND node_id=? "
-                "AND status IN ('PENDING','RUNNING')",
+                "AND status IN ('PENDING','RUNNING','UNKNOWN')",
                 (
                     checkpoint_status, execution_uid,
                     (payload.get("error") or {}).get("class"),
