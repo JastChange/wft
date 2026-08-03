@@ -177,6 +177,44 @@ def test_migrate_mid_step_failure_advances_nothing(tmp_path: Path, monkeypatch) 
     conn.close()
 
 
+def test_migrate_second_step_failure_rolls_back_earlier_steps(tmp_path: Path, monkeypatch) -> None:
+    """The whole migrate() is all-or-nothing across steps: when a later step
+    fails, an earlier step's already-applied DDL and every version bump are
+    rolled back too, so nothing advances past the pre-call version."""
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(schema, "_MIGRATIONS", {
+        1: ("CREATE TABLE t1(x INTEGER)",),
+        2: ("CREATE TABLE t2(x INTEGER THIS IS NOT SQL)",),
+    })
+    conn = Database(tmp_path / "wft.db").connect()
+    with pytest.raises(sqlite3.OperationalError):
+        migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    for table in ("t1", "t2"):
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name=?", (table,)
+        ).fetchone() is None, table
+    conn.close()
+
+
+def test_migrate_multi_step_success_sets_final_version(tmp_path: Path, monkeypatch) -> None:
+    """All pending steps apply in one transaction and land on SCHEMA_VERSION."""
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(schema, "_MIGRATIONS", {
+        1: ("CREATE TABLE t1(x INTEGER)",),
+        2: ("CREATE TABLE t2(x INTEGER)",),
+        3: ("CREATE TABLE t3(x INTEGER)",),
+    })
+    conn = Database(tmp_path / "wft.db").connect()
+    migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    for table in ("t1", "t2", "t3"):
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name=?", (table,)
+        ).fetchone() is not None, table
+    conn.close()
+
+
 # ----------------------------------------------------------- run creation
 
 
@@ -378,6 +416,125 @@ def test_start_run_state_failure_writes_no_audit(store: Store) -> None:
         audit_event=build_event(rid, "run_started", "run started"),
     ) is False
     assert _event_types(store, rid) == ["run_started"]
+
+
+# ------------------------------------------- create_run + node_tasks + audit
+
+
+def test_create_run_with_nodes_same_tx_consistent(store: Store) -> None:
+    """run + initial node_tasks + run_created land in one transaction."""
+    rid = "01HX0" + "A" * 21
+    run_id, created = store.create_run(
+        _run_spec(rid),
+        audit_event=build_event(
+            rid, "run_created", "run created", data={"targeted": 2}
+        ),
+        node_ids=["node-a", "node-b"],
+    )
+    assert run_id == rid
+    assert created is True
+    assert _event_types(store, rid) == ["run_created"]
+    assert [t["status"] for t in store.get_node_tasks(rid)] == ["PENDING", "PENDING"]
+
+
+def test_create_run_with_nodes_audit_failure_rolls_back_all(tmp_path: Path, monkeypatch) -> None:
+    """Fault injection: an audit-event write failing rolls back the Run row and
+    its node task rows, so no targeted=N run can exist without checkpoints."""
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+
+    def _boom(conn, run_id, event):
+        raise WFTStorageError("event write failed")
+
+    monkeypatch.setattr(store, "_insert_event", _boom)
+    with pytest.raises(WFTStorageError, match="event write failed"):
+        store.create_run(
+            _run_spec("01HX0" + "A" * 21),
+            audit_event=build_event(
+                "01HX0" + "A" * 21, "run_created", "run created", data={"targeted": 1}
+            ),
+            node_ids=["node-a"],
+        )
+    with store.database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM node_tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0
+
+
+def test_create_run_with_nodes_state_failure_rolls_back_all(tmp_path: Path) -> None:
+    """Fault injection: a node-task write failing rolls back the Run row and
+    the run_created event, so checkpoints can never trail a run's audit."""
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+    # A trigger aborting any node_tasks INSERT simulates the write failing at
+    # the SQL layer (sqlite3.Connection is immutable, so the class can't be
+    # monkeypatched); the whole create_run transaction must roll back.
+    with store.database.connect_migrated() as conn:
+        conn.execute(
+            "CREATE TRIGGER boom_node_tasks BEFORE INSERT ON node_tasks "
+            "BEGIN SELECT RAISE(ABORT, 'node task write failed'); END"
+        )
+    with pytest.raises(sqlite3.DatabaseError, match="node task write failed"):
+        store.create_run(
+            _run_spec("01HX0" + "A" * 21),
+            audit_event=build_event(
+                "01HX0" + "A" * 21, "run_created", "run created", data={"targeted": 1}
+            ),
+            node_ids=["node-a"],
+        )
+    with store.database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM node_tasks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0
+
+
+# ------------------------------------------- checkpoint->RUNNING + node_started
+
+
+def test_set_node_task_running_event_same_tx(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.set_node_task(
+        rid, "node-a", "RUNNING",
+        event=build_event(rid, "node_started", "node started", node_id="node-a"),
+    ) is True
+    assert store.get_node_task(rid, "node-a")["status"] == "RUNNING"
+    assert _event_types(store, rid) == ["node_started"]
+
+
+def test_set_node_task_running_event_failure_rolls_back_checkpoint(tmp_path: Path, monkeypatch) -> None:
+    """Fault injection: an audit-event write failing rolls back the PENDING ->
+    RUNNING checkpoint, so a node can never be RUNNING without node_started."""
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+
+    def _boom(conn, run_id, event):
+        raise WFTStorageError("event write failed")
+
+    monkeypatch.setattr(store, "_insert_event", _boom)
+    with pytest.raises(WFTStorageError, match="event write failed"):
+        store.set_node_task(
+            rid, "node-a", "RUNNING",
+            event=build_event(rid, "node_started", "node started", node_id="node-a"),
+        )
+    assert store.get_node_task(rid, "node-a")["status"] == "PENDING"
+    assert _event_types(store, rid) == []
+
+
+def test_set_node_task_state_failure_writes_no_event(store: Store) -> None:
+    """The rowcount guard: a checkpoint that cannot apply must not audit."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.set_node_task(rid, "node-a", "RUNNING") is True
+    assert store.set_node_task(rid, "node-a", "SUCCEEDED", execution_uid="u1") is True
+    # A terminal checkpoint cannot be rewritten; the node_started event must not land.
+    assert store.set_node_task(
+        rid, "node-a", "RUNNING",
+        event=build_event(rid, "node_started", "node started", node_id="node-a"),
+    ) is False
+    assert _event_types(store, rid) == []
 
 
 # ------------------------------------------------------- node result commit
@@ -728,6 +885,8 @@ def test_blob_list_excludes_temps_and_junk(tmp_path: Path) -> None:
     blob.write(b"b")
     (tmp_path / "blobs" / ".blob.leftover").write_bytes(b"partial")
     (tmp_path / "blobs" / "not-a-blob").write_bytes(b"junk")
+    # A 64-hex-named DIRECTORY is not a completed blob and must not be listed.
+    (tmp_path / "blobs" / ("c" * 64)).mkdir()
     names = blob.list()
     assert len(names) == 2
     assert all(len(n) == 64 for n in names)

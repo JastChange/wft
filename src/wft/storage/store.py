@@ -71,7 +71,11 @@ class Store:
     # --------------------------------------------------------------- runs
 
     def create_run(
-        self, run_spec: dict, *, audit_event: dict | None = None
+        self,
+        run_spec: dict,
+        *,
+        audit_event: dict | None = None,
+        node_ids: list[str] | None = None,
     ) -> tuple[str, bool]:
         """Persist a validated Contract-02 payload; enforce idempotency.
 
@@ -79,9 +83,10 @@ class Store:
         Run (same idempotency_key and same parameters) already exists and is
         returned (no audit event is written for a reuse). Same key with
         different parameters raises :class:`WFTIdempotencyConflict`. When a new
-        Run is created, ``audit_event`` (a Contract-09 envelope) is written in
-        the same transaction as the Run row, so the run_created audit can never
-        land without its business state or vice versa.
+        Run is created, ``audit_event`` (a Contract-09 envelope) and the
+        initial ``node_ids`` task rows are written in the SAME transaction as
+        the Run row, so the run_created audit and its targeted node checkpoints
+        can never land without the Run (or vice versa).
         """
         run_id = run_spec["run_id"]
         trigger = run_spec.get("trigger") or {}
@@ -111,6 +116,13 @@ class Store:
             )
             if audit_event is not None:
                 self._insert_event(conn, run_id, audit_event)
+            for node_id in node_ids or ():
+                conn.execute(
+                    "INSERT OR IGNORE INTO node_tasks "
+                    "(run_id, node_id, status, attempt_count, started_at, finished_at) "
+                    "VALUES (?, ?, 'PENDING', 0, NULL, NULL)",
+                    (run_id, node_id),
+                )
             return run_id, True
 
     def get_run(self, run_id: str) -> dict | None:
@@ -238,11 +250,15 @@ class Store:
         *,
         execution_uid: str | None = None,
         error_class: str | None = None,
+        event: dict | None = None,
     ) -> bool:
         """Transition a node task under CAS; False when the rewrite is illegal.
 
         Terminal statuses may never be rewritten and RUNNING may only follow a
         non-terminal state, so a finished node cannot be silently re-flagged.
+        When the transition applies, ``event`` (a Contract-09 envelope) is
+        written in the same transaction as the checkpoint update, so a node
+        state change and its audit can never land on only one side.
         """
         now = now_iso()
         with self.transaction() as conn:
@@ -263,6 +279,8 @@ class Store:
                     "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')",
                     (status, execution_uid, error_class, now, now, run_id, node_id),
                 )
+            if cur.rowcount == 1 and event is not None:
+                self._insert_event(conn, run_id, event)
             return cur.rowcount == 1
 
     # --------------------------------------------------- node result commit
@@ -379,13 +397,6 @@ class Store:
                     "(PENDING/RUNNING) state"
                 )
         return self._persist_ack("execution_result", execution_uid, now, ack_event_ids)
-
-    def insert_run_event(self, run_id: str, event: dict) -> dict:
-        now = now_iso()
-        event_id = event["payload"]["event_id"]
-        with self.transaction() as conn:
-            self._insert_event(conn, run_id, event)
-        return self._persist_ack("run_event", event_id, now, [])
 
     def finalize_run(
         self,

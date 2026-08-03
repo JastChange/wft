@@ -84,6 +84,7 @@ def create_run(store: Store, run_spec: dict, node_ids: list[str]) -> tuple[str, 
     payload = run_spec["payload"]
     run_id, created = store.create_run(
         payload,
+        node_ids=node_ids,
         audit_event=build_event(
             payload["run_id"],
             "run_created",
@@ -91,8 +92,6 @@ def create_run(store: Store, run_spec: dict, node_ids: list[str]) -> tuple[str, 
             data={"targeted": len(node_ids)},
         ),
     )
-    if created:
-        store.insert_node_tasks(run_id, node_ids)
     return run_id, created
 
 
@@ -157,21 +156,22 @@ async def execute_run(
 
     for node in nodes:
         node_id = node["node_id"]
-        if not store.set_node_task(run_id, node_id, "RUNNING"):
-            raise WFTError(
-                f"node {node_id}: cannot transition to RUNNING "
-                "(terminal node task cannot be rewritten)"
-            )
-        store.insert_run_event(
+        if not store.set_node_task(
             run_id,
-            build_event(
+            node_id,
+            "RUNNING",
+            event=build_event(
                 run_id,
                 "node_started",
                 f"node {node_id} started",
                 severity="debug",
                 node_id=node_id,
             ),
-        )
+        ):
+            raise WFTError(
+                f"node {node_id}: cannot transition to RUNNING "
+                "(terminal node task cannot be rewritten)"
+            )
         result, degraded_node, secondary_errors, attempts = await _execute_node(
             store,
             run_id,

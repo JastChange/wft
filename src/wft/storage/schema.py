@@ -5,10 +5,11 @@ binding: no separate ``meta.schema_version`` row). ``synchronous=FULL`` is set
 uniformly for the kill -9 durability gate; WAL, ``foreign_keys=ON`` and a
 ``busy_timeout`` are configured in :class:`wft.storage.db.Database`.
 
-Each migration step runs in its own transaction and is all-or-nothing: a
-mid-step failure rolls back every DDL statement AND the ``user_version`` bump,
-so a partial schema can never be observed. A database at a *newer* version is
-rejected rather than downgraded.
+One ``migrate()`` call is all-or-nothing: every pending step's DDL and the
+final ``user_version`` write run in a single transaction, so a failure at any
+point returns both the schema and ``user_version`` to exactly what they were
+before the call -- never an intermediate version. A database at a *newer*
+version is rejected rather than downgraded.
 """
 from __future__ import annotations
 
@@ -127,7 +128,7 @@ CREATE INDEX idx_outbox_status ON outbox(status);
 
 
 # target schema version -> ordered DDL statements. A step may only ADD structure;
-# ``PRAGMA user_version`` is bumped inside the same transaction as its DDL.
+# ``PRAGMA user_version`` is bumped in the same transaction as every step's DDL.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: _split_statements(_DDL_V1),
 }
@@ -136,11 +137,12 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring the schema up to ``SCHEMA_VERSION`` via ``PRAGMA user_version``.
 
-    Steps are applied strictly forward from the current version. Every step is
-    all-or-nothing (DDL + version bump in one transaction), so a crash or error
-    mid-way leaves both the schema and ``user_version`` exactly as they were.
-    A database already at a newer version is rejected: downgrading an unknown
-    schema could corrupt it, so it is safer to refuse than to guess.
+    All pending steps are applied strictly forward from the current version in
+    ONE transaction. Any DDL failure or the final ``user_version`` write
+    failing rolls the whole migration back to the pre-call version and schema,
+    so an intermediate version can never be observed. A database already at a
+    newer version is rejected: downgrading an unknown schema could corrupt it,
+    so it is safer to refuse than to guess.
     """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version > SCHEMA_VERSION:
@@ -148,23 +150,27 @@ def migrate(conn: sqlite3.Connection) -> None:
             f"database schema is version {version}, newer than this build "
             f"(max {SCHEMA_VERSION}); refusing to migrate/downgrade"
         )
-    for target in range(version + 1, SCHEMA_VERSION + 1):
-        statements = _MIGRATIONS.get(target)
-        if statements is None:
-            raise WFTStorageError(f"no migration defined for schema version {target}")
-        _apply_migration(conn, target, statements)
-
-
-def _apply_migration(
-    conn: sqlite3.Connection, target: int, statements: tuple[str, ...]
-) -> None:
-    """Apply one step atomically: DDL and the ``user_version`` bump together."""
+    if version == SCHEMA_VERSION:
+        return
+    steps = _pending_steps(version)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for statement in statements:
-            conn.execute(statement)
-        conn.execute(f"PRAGMA user_version = {target}")
+        for _target, statements in steps:
+            for statement in statements:
+                conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def _pending_steps(version: int) -> list[tuple[int, tuple[str, ...]]]:
+    """Validate and collect every step from ``version + 1`` to ``SCHEMA_VERSION``."""
+    steps: list[tuple[int, tuple[str, ...]]] = []
+    for target in range(version + 1, SCHEMA_VERSION + 1):
+        statements = _MIGRATIONS.get(target)
+        if statements is None:
+            raise WFTStorageError(f"no migration defined for schema version {target}")
+        steps.append((target, statements))
+    return steps

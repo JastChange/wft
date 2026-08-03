@@ -56,14 +56,15 @@ class BlobStore:
     def list(self) -> list[str]:
         """Return the stored content-addressed blob names (orphans included).
 
-        Temp files and any non-hex leftovers are excluded, so the result is
-        exactly the set of completed blobs that ``find_orphan_blobs`` compares
-        against the DB's references.
+        Temp files, any non-hex leftovers and hex-named directories are
+        excluded, so the result is exactly the set of completed blob FILES that
+        ``find_orphan_blobs`` compares against the DB's references.
         """
         if not self.blob_dir.is_dir():
             return []
         return sorted(
-            p.name for p in self.blob_dir.iterdir() if _HEX_RE.match(p.name)
+            p.name for p in self.blob_dir.iterdir()
+            if p.is_file() and _HEX_RE.match(p.name)
         )
 
 
