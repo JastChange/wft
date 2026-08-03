@@ -10,8 +10,9 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-The hosted run #10 baseline was 344 tests. The current unpushed local
-fixture work has 352 tests. The in-process SSH fixture in
+The hosted run #10 baseline was 344 tests. Commit 68a8d7d validated the
+tests/docs fixture baseline at 352 tests; current HEAD d6e18e5 adds the
+approved SSH error regressions and validates 354 tests. The in-process SSH fixture in
 `tests/ssh_test_server.py` uses strict known-hosts verification, SFTP upload,
 remote SHA-256 verification, and deterministic fault fixtures. HTTP fault
 responses for webhook/LLM integration tests are in `tests/http_fault_stubs.py`;
