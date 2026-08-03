@@ -30,6 +30,23 @@ def _j(obj: object) -> str:
     return json.dumps(obj, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
+def _param_json(spec_or_json: str | dict) -> str:
+    """Serialize the idempotency identity of a RunSpec payload.
+
+    The generated ``run_id`` and the timing metadata ``trigger.requested_at`` are
+    not parameters: a re-submission minting a fresh run_id at a later time still
+    matches when every execution-affecting field is identical (AC-011).
+    """
+    spec = json.loads(spec_or_json) if isinstance(spec_or_json, str) else spec_or_json
+    trigger = spec.get("trigger")
+    if isinstance(trigger, dict):
+        spec = {
+            **spec,
+            "trigger": {k: v for k, v in trigger.items() if k != "requested_at"},
+        }
+    return _j({k: v for k, v in spec.items() if k != "run_id"})
+
+
 class Store:
     def __init__(self, database: Database, blob_dir: str | Path | None = None):
         self.database = database
@@ -72,7 +89,9 @@ class Store:
                     (idem,),
                 ).fetchone()
                 if existing is not None:
-                    if existing["run_spec_json"] == spec_json:
+                    # The parameter identity excludes the generated run_id, so a
+                    # re-submission minting a fresh run_id still matches (AC-011).
+                    if _param_json(existing["run_spec_json"]) == _param_json(spec_json):
                         return existing["run_id"], False
                     raise WFTIdempotencyConflict(
                         f"idempotency_key {idem!r} already used with different parameters"
@@ -268,9 +287,34 @@ class Store:
             )
         return self._persist_ack("execution_result", execution_uid, now, ack_event_ids)
 
+    def record_attempts(
+        self, run_id: str, node_id: str, execution_uid: str, attempts: list[dict]
+    ) -> None:
+        """Append per-attempt rows for an execution (attempt_id unique per try)."""
+        with self.transaction() as conn:
+            for attempt in attempts:
+                conn.execute(
+                    "INSERT OR REPLACE INTO attempts "
+                    "(execution_uid, attempt_id, attempt_seq, status, error_class, "
+                    "error_category, error_message, retryable, started_at, finished_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        execution_uid,
+                        attempt["attempt_id"],
+                        attempt["attempt_seq"],
+                        attempt["status"],
+                        attempt.get("error_class"),
+                        attempt.get("error_category"),
+                        attempt.get("error_message"),
+                        int(bool(attempt.get("retryable"))),
+                        attempt["started_at"],
+                        attempt["finished_at"],
+                    ),
+                )
+
     def insert_run_event(self, run_id: str, event: dict) -> dict:
         now = now_iso()
-        event_id = event["event_id"]
+        event_id = event["payload"]["event_id"]
         with self.transaction() as conn:
             self._insert_event(conn, run_id, event)
         return self._persist_ack("run_event", event_id, now, [])

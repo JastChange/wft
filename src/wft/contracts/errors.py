@@ -31,3 +31,7 @@ class WFTIdempotencyConflict(WFTError):
 
 class WFTStorageError(WFTError):
     """A storage-layer operation failed (database, blob, or outbox write)."""
+
+
+class WFTExecutionError(WFTError):
+    """A node execution could not be attempted (bad auth ref, bad config)."""

@@ -11,10 +11,10 @@ import sys
 
 from wft import __version__
 
-from . import hostkey_cmd, inventory_cmd, script_cmd
+from . import hostkey_cmd, inventory_cmd, run_cmd, script_cmd
 from .common import EXIT_CONFIG, EXIT_OK, emit_json, envelope
 
-NOT_IMPLEMENTED = ("run", "history", "scheduler", "storage", "export")
+NOT_IMPLEMENTED = ("history", "scheduler", "storage", "export")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_cmd.add_parser(subparsers)
     hostkey_cmd.add_parser(subparsers)
     script_cmd.add_parser(subparsers)
+    run_cmd.add_parser(subparsers)
     return parser
 
 

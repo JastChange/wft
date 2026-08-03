@@ -74,7 +74,7 @@ def test_script_resolve_unknown_is_config_error() -> None:
 
 
 def test_not_implemented_command_returns_2() -> None:
-    for command in ("run", "history", "scheduler", "storage", "export"):
+    for command in ("history", "scheduler", "storage", "export"):
         proc = run_cli(command)
         assert proc.returncode == EXIT_CONFIG
         assert "not implemented" in proc.stderr
@@ -89,11 +89,17 @@ def _assert_contract01_valid(payload: dict) -> None:
 
 
 def test_not_implemented_json_output() -> None:
-    proc = run_cli("run", "--json")
+    proc = run_cli("history", "--json")
     assert proc.returncode == EXIT_CONFIG
     payload = json.loads(proc.stdout)
     _assert_contract01_valid(payload)
     assert payload["payload"]["available"] is False
+
+
+def test_run_requires_arguments() -> None:
+    proc = run_cli("run")
+    assert proc.returncode == EXIT_CONFIG
+    assert "required" in proc.stderr
 
 
 def test_inventory_check_json_output() -> None:
