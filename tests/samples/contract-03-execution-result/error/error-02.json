@@ -1,7 +1,7 @@
 {
   "meta": {
     "schema_name": "contract-03-execution-result",
-    "schema_version": "1.0.0",
+    "schema_version": "1.1.0",
     "producer": "test",
     "created_at": "2026-08-03T10:00:00+00:00",
     "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",

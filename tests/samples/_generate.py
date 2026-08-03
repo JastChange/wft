@@ -92,19 +92,28 @@ def samples() -> None:
         "stdout": stream(inline="disk usage ok"), "stderr": stream(inline=""),
         "flags": [],
     }
-    write(k, "normal", "normal-01", envelope(k, ok_payload, run_id=ULID, stage="execution"))
+    v110 = {"schema_version": "1.1.0"}
+    write(k, "normal", "normal-01", envelope(k, ok_payload, run_id=ULID, stage="execution", **v110))
     bound = dict(ok_payload)
     bound["stdout"] = stream(blob_ref="blobs/abc.bin", bytes=1048576, truncated=True)
     bound["flags"] = ["truncated", "output_overflow"]
-    write(k, "boundary", "boundary-01", envelope(k, bound, run_id=ULID, stage="execution"))
+    write(k, "boundary", "boundary-01", envelope(k, bound, run_id=ULID, stage="execution", **v110))
+    # Declared non-zero success code: schema-valid since Contract-03 1.1.0.
+    nonzero = dict(ok_payload)
+    nonzero["exit_code"] = 42
+    write(k, "boundary", "boundary-02", envelope(k, nonzero, run_id=ULID, stage="execution", **v110))
     failed = dict(ok_payload)
     failed["status"] = "FAILED"
     failed["exit_code"] = None
     failed["error"] = {"class": "bogus_class", "category": "TRANSIENT",
                        "message": "not in error matrix", "retryable": True}
-    write(k, "error", "error-01", envelope(k, failed, run_id=ULID, stage="execution"))
+    write(k, "error", "error-01", envelope(k, failed, run_id=ULID, stage="execution", **v110))
     # FAILED but no error -> allOf violation
-    write(k, "error", "error-02", envelope(k, failed_no_err(), run_id=ULID, stage="execution"))
+    write(k, "error", "error-02", envelope(k, failed_no_err(), run_id=ULID, stage="execution", **v110))
+    # SUCCEEDED with null exit_code -> the 1.1.0 then-block requires an integer.
+    null_exit = dict(ok_payload)
+    null_exit["exit_code"] = None
+    write(k, "error", "error-03", envelope(k, null_exit, run_id=ULID, stage="execution", **v110))
 
 
 def failed_no_err() -> dict:

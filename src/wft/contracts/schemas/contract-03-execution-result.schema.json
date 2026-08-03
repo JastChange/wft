@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://wft.local/contracts/contract-03-execution-result/1.0.0",
+  "$id": "https://wft.local/contracts/contract-03-execution-result/1.1.0",
   "title": "Contract-03 ExecutionResult",
   "type": "object",
   "additionalProperties": false,
@@ -37,7 +37,10 @@
         },
         {
           "if": { "properties": { "status": { "const": "SUCCEEDED" } } },
-          "then": { "properties": { "exit_code": { "const": 0 } } }
+          "then": {
+            "required": ["exit_code"],
+            "properties": { "exit_code": { "type": "integer", "minimum": 0, "maximum": 255 } }
+          }
         }
       ]
     }

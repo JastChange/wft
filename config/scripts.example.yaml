@@ -2,6 +2,9 @@
 # Only read_only scripts are accepted in MVP (AC-008B). `sha256` must match the
 # actual file content; run `wft script check --file config/scripts.example.yaml`
 # to verify. `path` is relative to this file's directory and must stay inside it.
+# `expected_exit_codes` (optional, default [0]) lists the exit codes a
+# SUCCEEDED execution may return; any other code is a semantic violation of
+# Contract-03 1.1.0 (see wft.contracts.validate.validate_execution_result).
 scripts:
   - name: disk-usage
     path: ../scripts/disk_usage.sh
@@ -10,6 +13,7 @@ scripts:
     shell: bash
     timeout_sec: 30
     enabled: true
+    expected_exit_codes: [0]
   - name: load-average
     path: ../scripts/load_average.sh
     sha256: 221eaaae18b254fb594c28d942c8723ada77dfc39da786e7176fc14704a91875
@@ -17,3 +21,4 @@ scripts:
     shell: bash
     timeout_sec: 30
     enabled: true
+    expected_exit_codes: [0]

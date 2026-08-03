@@ -28,6 +28,7 @@ class Script:
     shell: str
     timeout_sec: int
     enabled: bool
+    expected_exit_codes: tuple[int, ...] = (0,)
 
     @property
     def short_hash(self) -> str:
@@ -110,6 +111,9 @@ def load_registry_payload(path: Path) -> list[Script]:
                 f"{path}: script {entry['name']!r} SHA-256 mismatch: declared "
                 f"{declared}, file {script_path} is {actual}"
             )
+        # expected_exit_codes defaults to (0,) explicitly; the JSON Schema
+        # default must not be relied on to materialise values into the model.
+        expected = tuple(int(code) for code in entry.get("expected_exit_codes", [0]))
         scripts.append(
             Script(
                 name=entry["name"],
@@ -119,6 +123,7 @@ def load_registry_payload(path: Path) -> list[Script]:
                 shell=entry["shell"],
                 timeout_sec=entry["timeout_sec"],
                 enabled=bool(entry["enabled"]),
+                expected_exit_codes=expected,
             )
         )
     return scripts
@@ -182,4 +187,17 @@ def _validate_payload(path: Path, payload: dict) -> list[str]:
                 f"scripts[{i}] risk={risk!r} is not allowed in MVP; only read_only "
                 "scripts may be registered (AC-008B)"
             )
+        codes = entry.get("expected_exit_codes")
+        if codes is not None:
+            if not isinstance(codes, list) or not codes:
+                problems.append(f"scripts[{i}] expected_exit_codes must be a non-empty list")
+            else:
+                seen: set[int] = set()
+                for code in codes:
+                    if not isinstance(code, int) or isinstance(code, bool) or not 0 <= code <= 255:
+                        problems.append(f"scripts[{i}] expected_exit_codes entry {code!r} must be an integer in 0..255")
+                    elif code in seen:
+                        problems.append(f"scripts[{i}] expected_exit_codes contains duplicate {code}")
+                    else:
+                        seen.add(code)
     return problems

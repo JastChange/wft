@@ -115,3 +115,27 @@ def validate_contract_all(key: str, instance: object) -> list[str]:
     problems = registry.validate_with_errors(key, instance)
     problems += check_semantics(key, instance)
     return problems
+
+
+def validate_execution_result(
+    instance: object,
+    *,
+    expected_exit_codes: tuple[int, ...] = (0,),
+) -> list[str]:
+    """Validate a Contract-03 result, including the cross-contract exit-code rule.
+
+    Contract-03 1.1.0 accepts any integer success code at the schema level; the
+    script registry (Contract-12) declares which codes count as success. A
+    ``SUCCEEDED`` result whose ``exit_code`` is not among the resolved script's
+    ``expected_exit_codes`` is a semantic violation.
+    """
+    problems = validate_contract_all("contract-03-execution-result", instance)
+    payload = instance.get("payload") if isinstance(instance, dict) else None
+    if isinstance(payload, dict) and payload.get("status") == "SUCCEEDED":
+        exit_code = payload.get("exit_code")
+        if exit_code not in expected_exit_codes:
+            problems.append(
+                f"SUCCEEDED exit_code={exit_code!r} not in expected_exit_codes "
+                f"{sorted(expected_exit_codes)} of the resolved script"
+            )
+    return problems
