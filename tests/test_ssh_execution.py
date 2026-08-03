@@ -138,9 +138,14 @@ def test_large_output_keeps_tail_and_tracks_total(tmp_path: Path) -> None:
 
 def test_uploaded_script_is_0600(tmp_path: Path) -> None:
     # The script must be uploaded via exclusive 0600 create: a reader should
-    # never observe it with weaker permissions or half-written.
+    # never observe it with weaker permissions or half-written. The mode is read
+    # with Python's os.stat (portable across macOS/GNU stat flavors).
     script_path = tmp_path / "stat_self.sh"
-    script_path.write_text("#!/bin/bash\nstat -f '%Lp' \"$0\"\n", encoding="utf-8")
+    script_path.write_text(
+        "#!/bin/bash\n"
+        'python3 -c \'import os,sys; print("%03o" % (os.stat(sys.argv[1]).st_mode & 0o777))\' "$0"\n',
+        encoding="utf-8",
+    )
     script = _script(script_path)
 
     outcome = _run_server_and(
@@ -217,3 +222,100 @@ def test_exec_timeout_maps_to_exec_timeout(tmp_path: Path) -> None:
     assert outcome.error is not None
     assert outcome.error["class"] == "exec_timeout"
     assert outcome.error["retryable"] is True
+
+
+def test_large_utf8_output_not_misdetected_as_binary(tmp_path: Path) -> None:
+    # 2.1 MB of legitimate Chinese UTF-8: the 1 MiB cut lands mid-character but
+    # the full-stream validity must survive, so the tail is UTF-8, not binary.
+    size = 700000  # '你' is 3 UTF-8 bytes -> 2.1 MiB total
+    script_path = tmp_path / "chinese.sh"
+    script_path.write_text(
+        "#!/bin/bash\n"
+        f'python3 -c "import sys; sys.stdout.write(\'你\' * {size})"\n',
+        encoding="utf-8",
+    )
+    script = _script(script_path)
+
+    outcome = _run_server_and(
+        lambda host, port, key_path, known_hosts_path: execute_script(
+            node=_node(host, port, key_path=key_path),
+            script=script,
+            known_hosts_path=known_hosts_path,
+            connect_timeout_sec=5,
+            exec_timeout_sec=10,
+        ),
+        tmp_path,
+    )
+    assert outcome.error is None
+    assert outcome.exit_code == 0
+    assert outcome.stdout_total == size * 3
+    assert outcome.stdout_valid_utf8 is True
+    assert STREAM_HARD_CAP - 3 <= len(outcome.stdout) <= STREAM_HARD_CAP
+    decoded = outcome.stdout.decode("utf-8")  # must not raise
+    assert decoded == "你" * len(decoded)
+
+    # The full result build must not degrade: legit UTF-8 is never binary.
+    from wft.execution.result import build_execution_result
+    from wft.storage.blobs import BlobStore
+
+    result, degraded, secondary = build_execution_result(
+        run_id="01HX0" + "A" * 21,
+        execution_uid="0190a2b3-c4d5-46e7-8890-1234567890ab",
+        node_id="node-a",
+        script=script,
+        status="SUCCEEDED",
+        attempt_count=1,
+        started_at="2026-08-03T10:00:01+00:00",
+        finished_at="2026-08-03T10:00:02+00:00",
+        duration_ms=1000,
+        exit_code=0,
+        stdout_bytes=outcome.stdout,
+        stderr_bytes=b"",
+        stdout_total=outcome.stdout_total,
+        stdout_valid_utf8=outcome.stdout_valid_utf8,
+        stderr_valid_utf8=outcome.stderr_valid_utf8,
+        error=None,
+        blobs=BlobStore(tmp_path / "blobs"),
+    )
+    assert degraded is False
+    assert secondary == ()
+    assert result["payload"].get("error") is None
+    assert result["payload"]["stdout"]["encoding"] == "utf-8"
+
+
+def test_exec_timeout_reaps_process_and_cleanup(tmp_path: Path) -> None:
+    # After an exec timeout the remote process must be terminated (not left
+    # running detached from the result) and the uploaded temp script removed.
+    for pattern in ("wft-*.sh", "wft-*.pid", "wft-*.done"):
+        for stale in Path("/tmp").glob(pattern):
+            stale.unlink()
+
+    script_path = tmp_path / "slow.sh"
+    script_path.write_text(
+        "#!/bin/bash\n"
+        'echo $$ > "${0%.sh}.pid"\n'
+        "sleep 30\n"
+        'touch "${0%.sh}.done"\n',
+        encoding="utf-8",
+    )
+
+    async def _run(host, port, key_path, known_hosts_path):
+        return await execute_script(
+            node=_node(host, port, key_path=key_path),
+            script=_script(script_path),
+            known_hosts_path=known_hosts_path,
+            connect_timeout_sec=5,
+            exec_timeout_sec=1,
+        )
+
+    outcome = _run_server_and(_run, tmp_path)
+    assert outcome.error is not None
+    assert outcome.error["class"] == "exec_timeout"
+
+    # The script's own PID must no longer be alive.
+    for pid_file in Path("/tmp").glob("wft-*.pid"):
+        pid = int(pid_file.read_text().strip())
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    assert not list(Path("/tmp").glob("wft-*.sh"))
+    assert not list(Path("/tmp").glob("wft-*.done"))

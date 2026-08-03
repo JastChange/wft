@@ -9,6 +9,7 @@ global error matrix so retry/aggregation stay consistent.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import errno as _errno
 import os
 import secrets
@@ -21,13 +22,14 @@ import asyncssh
 from asyncssh.sftp import SFTPAttrs
 
 from wft.contracts.errors import WFTExecutionError
-from wft.execution.result import STREAM_HARD_CAP
+from wft.execution.result import STREAM_HARD_CAP, align_utf8_tail
 from wft.scriptreg.registry import Script
 
 from .errors import error_dict
 
 _AUTH_FAILED = "auth_failed"
 _DRAIN_CHUNK = 64 * 1024
+_REAP_TIMEOUT_SEC = 5
 
 
 @dataclass
@@ -41,6 +43,11 @@ class ExecutionOutcome:
     # builder uses these to decide ``truncated`` once the tail is capped.
     stdout_total: int = 0
     stderr_total: int = 0
+    # Full-stream UTF-8 validity, decided incrementally in ``_drain``. A 1 MiB
+    # cut can land mid-character, so the retained tail alone cannot prove
+    # binary-ness; the builder needs this to classify the stream.
+    stdout_valid_utf8: bool = True
+    stderr_valid_utf8: bool = True
 
 
 async def execute_script(
@@ -165,20 +172,22 @@ async def _run_process(conn: asyncssh.SSHClientConnection, cmd: str) -> Executio
     """Stream the process stdout/stderr with a bounded tail (see ``_drain``).
 
     The exec timeout is applied by the caller with ``asyncio.wait_for``; on
-    cancellation the remote process is terminated so it cannot keep running.
+    cancellation the remote process is reaped (terminate, then kill) so it
+    cannot keep running detached from this result.
     """
     proc = await conn.create_process(cmd, encoding=None)
     try:
-        (stdout_tail, stdout_total), (stderr_tail, stderr_total) = await asyncio.gather(
+        (stdout_tail, stdout_total, stdout_valid), (
+            stderr_tail,
+            stderr_total,
+            stderr_valid,
+        ) = await asyncio.gather(
             _drain(proc.stdout, STREAM_HARD_CAP),
             _drain(proc.stderr, STREAM_HARD_CAP),
         )
         await proc.wait()
     except BaseException:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        await _reap_process(proc)
         raise
     return ExecutionOutcome(
         exit_code=proc.exit_status,
@@ -186,17 +195,47 @@ async def _run_process(conn: asyncssh.SSHClientConnection, cmd: str) -> Executio
         stderr=stderr_tail,
         stdout_total=stdout_total,
         stderr_total=stderr_total,
+        stdout_valid_utf8=stdout_valid,
+        stderr_valid_utf8=stderr_valid,
     )
 
 
-async def _drain(reader, cap: int) -> tuple[bytes, int]:
-    """Drain ``reader`` to EOF, retaining only the last ``cap`` bytes.
+async def _reap_process(proc: asyncssh.SSHClientProcess) -> None:
+    """Terminate the remote process and wait for it to exit before returning.
+
+    A timeout/cancel must not leave the remote script running after we leave:
+    send SIGTERM, briefly wait, and escalate to SIGKILL if it does not exit.
+    """
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SEC)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_REAP_TIMEOUT_SEC)
+        except Exception:
+            pass
+
+
+async def _drain(reader, cap: int) -> tuple[bytes, int, bool]:
+    """Drain ``reader`` to EOF, keeping only the last ``cap`` bytes.
 
     Every chunk is read so the remote process is never blocked on a full pipe,
     but at most ``cap`` bytes are kept (head dropped) to bound client memory.
+    Returns ``(tail, total, valid_utf8)``: the whole byte stream is validated
+    incrementally so a truncated fragment cannot be misclassified as binary,
+    and a known-valid tail is aligned to a UTF-8 character boundary.
     """
     total = 0
     tail = bytearray()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    valid = True
     while True:
         chunk = await reader.read(_DRAIN_CHUNK)
         if not chunk:
@@ -205,7 +244,19 @@ async def _drain(reader, cap: int) -> tuple[bytes, int]:
         tail.extend(chunk)
         if len(tail) > cap:
             del tail[: len(tail) - cap]
-    return bytes(tail), total
+        if valid:
+            try:
+                decoder.decode(chunk)
+            except UnicodeDecodeError:
+                valid = False
+    if valid:
+        try:
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            valid = False
+        if valid:
+            tail = bytearray(align_utf8_tail(bytes(tail)))
+    return bytes(tail), total, valid
 
 
 def _auth_options(node: dict) -> dict:

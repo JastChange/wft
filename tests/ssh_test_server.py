@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal as _signal
 
 import asyncssh
 from asyncssh.sftp import (
@@ -137,6 +138,9 @@ class _LocalSFTPServer(SFTPServer):
             raise SFTPNoSuchFile(os.fsdecode(path)) from None
 
 
+_SIGNALS = {name: getattr(_signal, "SIG" + name) for name in ("TERM", "KILL", "INT", "HUP", "QUIT")}
+
+
 async def _run_command(process: asyncssh.SSHServerProcess) -> None:
     try:
         command = process.channel.get_command() or ""
@@ -148,13 +152,33 @@ async def _run_command(process: asyncssh.SSHServerProcess) -> None:
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # A real sshd runs the remote command in its own session, so client
+            # signal requests (terminate/kill) can target the whole process
+            # tree via its process group.
+            start_new_session=True,
         )
+
+        def _kill_group(sig: int) -> None:
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        def _signal_received(name: str) -> None:
+            _kill_group(_SIGNALS.get(name, _signal.SIGTERM))
+
+        # Deliver client signals to the spawned tree and ensure it dies if the
+        # channel drops, like an sshd sending SIGHUP on session end.
+        process.signal_received = _signal_received  # type: ignore[method-assign]
+        process.connection_lost = lambda exc: _kill_group(_signal.SIGKILL)  # type: ignore[method-assign]
+
         out, err = await proc.communicate()
         # The server runs with encoding=None so raw bytes are transmitted
         # unchanged, emulating a real sshd (binary script output must survive).
         process.stdout.write(out)
         process.stderr.write(err)
-        process.exit(proc.returncode)
+        returncode = proc.returncode
+        process.exit((returncode & 0xFF) if returncode is not None else 0)
     except Exception:  # never let a broken command kill the server
         try:
             process.exit(1)

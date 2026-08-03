@@ -25,6 +25,11 @@ STREAM_HARD_CAP = 1024 * 1024
 RESULT_SCHEMA_VERSION = "1.1.0"
 FLAG_VALUES = frozenset({"truncated", "slow", "retried", "resumed", "output_overflow"})
 
+# Storage-layer blob writes retry internally (错误矩阵_v0.1.md: ``blob_write_failed``
+# is RESOURCE/retryable, max 2 retries). These attempts are internal to a single
+# SSH attempt and must never bump ``attempt_count``.
+_BLOB_WRITE_ATTEMPTS = 3
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -45,11 +50,41 @@ def _inline_empty() -> dict:
     }
 
 
+def align_utf8_tail(data: bytes) -> bytes:
+    """Drop up to 3 leading UTF-8 continuation bytes from ``data``.
+
+    A fixed-cap cut (1 MiB tail or the inline fallback) can land mid-character;
+    the saved fragment must start on a character boundary so it stays decodable
+    as UTF-8 and is never misclassified as binary. ``bytes``/``sha256`` then
+    describe exactly the saved fragment, per the approved output contract.
+    """
+    i = 0
+    while i < len(data) and i < 3 and 0x80 <= data[i] <= 0xBF:
+        i += 1
+    return data[i:] if i else data
+
+
+def _write_blob(blobs: BlobStore, content: bytes, *, context: str) -> tuple[str | None, dict | None]:
+    """Persist ``content`` with up to 3 attempts; return ``(blob_ref, error)``.
+
+    Retries are internal to the result build (错误矩阵 RESOURCE retry bound); a
+    successful retry does not degrade and does not create a new SSH attempt.
+    """
+    last: Exception | None = None
+    for _ in range(_BLOB_WRITE_ATTEMPTS):
+        try:
+            return blobs.write(content), None
+        except OSError as exc:
+            last = exc
+    return None, error_dict("blob_write_failed", f"{context}: {last}")
+
+
 def build_stream(
     name: str,
     data: bytes,
     blobs: BlobStore,
     total_bytes: int | None = None,
+    valid_utf8: bool | None = None,
 ) -> tuple[dict | None, list[str], bool, dict | None]:
     """Return ``(stream, flags, degraded, error)`` for a stdout/stderr stream.
 
@@ -60,32 +95,38 @@ def build_stream(
 
     ``degraded`` is True for non-UTF-8 (binary) content or when a blob write
     failed and the stream had to fall back. ``error`` is a ``blob_write_failed``
-    error dict when a blob write failed, else ``None``. When the SSH layer
-    already capped the tail (``total_bytes`` > the data length), ``truncated``
-    is decided from the original total instead of the capped ``data``.
+    error dict when a blob write failed, else ``None``. ``valid_utf8`` overrides
+    auto-detection with the SSH layer's full-stream assessment: a 1 MiB cut can
+    land mid-character, so the retained tail alone cannot prove binary-ness.
+    When the SSH layer already capped the tail (``total_bytes`` > the data
+    length), ``truncated`` is decided from the original total.
     """
     inline_cap = INLINE_STDOUT_CAP if name == "stdout" else INLINE_STDERR_CAP
     flags: list[str] = []
-    try:
-        data.decode("utf-8")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
-        encoding = "binary"
+    if valid_utf8 is None:
+        try:
+            data.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            encoding = "binary"
+    else:
+        encoding = "utf-8" if valid_utf8 else "binary"
 
     content = data if len(data) <= STREAM_HARD_CAP else data[-STREAM_HARD_CAP:]
     total = len(data) if total_bytes is None else total_bytes
     truncated = total > STREAM_HARD_CAP
     if truncated:
         flags.extend(["truncated", "output_overflow"])
+    if encoding == "utf-8":
+        # Align the tail to a UTF-8 boundary so inline/blob bytes stay decodable.
+        content = align_utf8_tail(content)
 
     if encoding == "binary":
-        try:
-            blob_ref = blobs.write(content)
-        except OSError as exc:
-            return None, flags, True, error_dict(
-                "blob_write_failed",
-                f"cannot persist binary {name} to blob: {exc}",
-            )
+        blob_ref, write_err = _write_blob(
+            blobs, content, context=f"cannot persist binary {name} to blob"
+        )
+        if write_err is not None:
+            return None, flags, True, write_err
         return (
             {
                 "blob_ref": blob_ref,
@@ -111,10 +152,11 @@ def build_stream(
             False,
             None,
         )
-    try:
-        blob_ref = blobs.write(content)
-    except OSError as exc:
-        fallback = content[-inline_cap:]
+    blob_ref, write_err = _write_blob(
+        blobs, content, context=f"blob write failed; {name} truncated to {inline_cap} bytes inline"
+    )
+    if write_err is not None:
+        fallback = align_utf8_tail(content[-inline_cap:])
         if "truncated" not in flags:
             flags.extend(["truncated", "output_overflow"])
         return (
@@ -127,10 +169,7 @@ def build_stream(
             },
             flags,
             True,
-            error_dict(
-                "blob_write_failed",
-                f"blob write failed; {name} truncated to {inline_cap} bytes inline: {exc}",
-            ),
+            write_err,
         )
     return (
         {
@@ -179,18 +218,31 @@ def build_execution_result(
     produced_at: str | None = None,
     stdout_total: int | None = None,
     stderr_total: int | None = None,
-) -> tuple[dict, bool]:
-    """Build and validate a Contract-03 envelope; return ``(envelope, degraded)``.
+    stdout_valid_utf8: bool | None = None,
+    stderr_valid_utf8: bool | None = None,
+) -> tuple[dict, bool, tuple[dict, ...]]:
+    """Build and validate a Contract-03 envelope.
 
-    ``degraded`` is True when either stream held non-UTF-8 bytes; callers should
-    then treat the run as DEGRADED. Raises :class:`WFTContractError` if the
-    built envelope fails Contract-03 validation (a developer bug).
+    Returns ``(envelope, degraded, secondary_errors)``. ``degraded`` is True
+    when either stream held non-UTF-8 bytes or a blob write fell back. Secondary
+    blob/decode errors that cannot fit the single Contract-03 ``error`` slot
+    (e.g. beside an ``exec_nonzero`` primary) are returned so the caller can
+    keep them in aggregate evidence instead of dropping them. Raises
+    :class:`WFTContractError` if the built envelope fails Contract-03 validation.
     """
     stdout_stream, stdout_flags, stdout_degraded, stdout_err = build_stream(
-        "stdout", stdout_bytes, blobs, total_bytes=stdout_total
+        "stdout",
+        stdout_bytes,
+        blobs,
+        total_bytes=stdout_total,
+        valid_utf8=stdout_valid_utf8,
     )
     stderr_stream, stderr_flags, stderr_degraded, stderr_err = build_stream(
-        "stderr", stderr_bytes, blobs, total_bytes=stderr_total
+        "stderr",
+        stderr_bytes,
+        blobs,
+        total_bytes=stderr_total,
+        valid_utf8=stderr_valid_utf8,
     )
     flags = sorted(set([*stdout_flags, *stderr_flags, *extra_flags]))
     unknown = set(flags) - FLAG_VALUES
@@ -198,23 +250,43 @@ def build_execution_result(
         raise ValueError(f"unknown result flags: {sorted(unknown)}")
 
     degraded = stdout_degraded or stderr_degraded
+    binary = (
+        (stdout_valid_utf8 is False)
+        or (stderr_valid_utf8 is False)
+        or (stdout_stream is not None and stdout_stream.get("encoding") == "binary")
+        or (stderr_stream is not None and stderr_stream.get("encoding") == "binary")
+    )
+    stream_err = stdout_err or stderr_err
+    decode_err = (
+        error_dict(
+            "output_decode_failed", "script output is not valid UTF-8 (binary content)"
+        )
+        if binary
+        else None
+    )
+
     if stdout_stream is None or stderr_stream is None:
         # A stream that cannot be inlined (binary) failed to persist to a blob:
         # the output is lost, so the result must be FAILED (错误矩阵_v0.1.md).
         status = "FAILED"
         degraded = True
         if error is None:
-            error = stdout_err or stderr_err
+            error = stream_err
         if stdout_stream is None:
             stdout_stream = _inline_empty()
         if stderr_stream is None:
             stderr_stream = _inline_empty()
-    elif degraded and error is None:
-        # Structured evidence for binary output: degrade the result and attach
-        # an output_decode_failed error so batch aggregation can count it.
-        error = error_dict(
-            "output_decode_failed", "script output is not valid UTF-8 (binary content)"
-        )
+    elif error is None:
+        # No caller-supplied primary error: promote the strongest stream-level
+        # evidence (blob_write_failed before output_decode_failed) so batch
+        # aggregation counts the real class.
+        error = stream_err or decode_err
+
+    secondary: list[dict] = []
+    if error is not None:
+        for extra in (stream_err, decode_err):
+            if extra is not None and extra["class"] != error["class"]:
+                secondary.append(extra)
 
     payload: dict = {
         "execution_uid": execution_uid,
@@ -247,4 +319,4 @@ def build_execution_result(
     )
     if problems:
         raise WFTContractError("contract-03-execution-result invalid: " + "; ".join(problems))
-    return envelope, stdout_degraded or stderr_degraded
+    return envelope, degraded, tuple(secondary)

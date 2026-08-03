@@ -172,7 +172,7 @@ async def execute_run(
                 node_id=node_id,
             ),
         )
-        result, degraded_node, attempts = await _execute_node(
+        result, degraded_node, secondary_errors, attempts = await _execute_node(
             store,
             run_id,
             node,
@@ -189,18 +189,18 @@ async def execute_run(
         else:
             counts["failed"] += 1
             any_failed = True
+        # Count the primary error once, then any secondary blob/decode errors
+        # that could not fit the single Contract-03 error slot (错误矩阵_v0.1.md:
+        # e.g. output_decode_failed or blob_write_failed beside exec_nonzero).
+        counted: set[str] = set()
         error = payload.get("error")
-        if error is not None and error["class"] != "output_decode_failed":
+        if error is not None:
             error_counts[error["class"]] = error_counts.get(error["class"], 0) + 1
-        if (
-            payload["stdout"].get("encoding") == "binary"
-            or payload["stderr"].get("encoding") == "binary"
-        ):
-            # Aggregate evidence for binary output even when the result already
-            # carries a primary failure error (错误矩阵_v0.1.md output_decode_failed).
-            error_counts["output_decode_failed"] = (
-                error_counts.get("output_decode_failed", 0) + 1
-            )
+            counted.add(error["class"])
+        for sec in secondary_errors:
+            if sec["class"] not in counted:
+                error_counts[sec["class"]] = error_counts.get(sec["class"], 0) + 1
+                counted.add(sec["class"])
 
         store.commit_execution_result(
             run_id,
@@ -278,13 +278,15 @@ async def _execute_node(
     script: Script,
     known_hosts_path,
     limits: dict,
-) -> tuple[dict, bool, list[dict]]:
+) -> tuple[dict, bool, tuple[dict, ...], list[dict]]:
     """Run one node with matrix-bounded retries.
 
-    Returns ``(result_envelope, degraded, attempts)`` where ``attempts`` is the
-    per-attempt log for the ``attempts`` table. The Contract-03 result spans the
-    whole logical execution (first attempt start -> final attempt finish), while
-    each attempt keeps its own ``started_at``/``finished_at``.
+    Returns ``(result_envelope, degraded, secondary_errors, attempts)`` where
+    ``attempts`` is the per-attempt log for the ``attempts`` table and
+    ``secondary_errors`` are blob/decode errors that could not fit the single
+    Contract-03 error slot. The Contract-03 result spans the whole logical
+    execution (first attempt start -> final attempt finish), while each attempt
+    keeps its own ``started_at``/``finished_at``.
     """
     node_id = node["node_id"]
     execution_uid = new_uuid7()
@@ -324,7 +326,7 @@ async def _execute_node(
             )
 
         logical_finished_at = now_iso()
-        result, degraded = build_execution_result(
+        result, degraded, secondary_errors = build_execution_result(
             run_id=run_id,
             execution_uid=execution_uid,
             node_id=node_id,
@@ -339,11 +341,13 @@ async def _execute_node(
             stderr_bytes=outcome.stderr,
             stdout_total=outcome.stdout_total,
             stderr_total=outcome.stderr_total,
+            stdout_valid_utf8=outcome.stdout_valid_utf8,
+            stderr_valid_utf8=outcome.stderr_valid_utf8,
             error=final_error,
             blobs=store.blobs,
             extra_flags=("retried",) if attempt_count > 1 else (),
         )
-        return result, degraded, attempts
+        return result, degraded, secondary_errors, attempts
 
 
 def _attempt_record(
