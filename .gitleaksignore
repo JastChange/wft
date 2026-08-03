@@ -1,0 +1,7 @@
+# Intentional idempotency-key fixtures in storage tests; not service credentials.
+2a225c26eb2a31c15dbc00b8e4e27baea6094cc8:tests/test_storage.py:generic-api-key:126
+2a225c26eb2a31c15dbc00b8e4e27baea6094cc8:tests/test_storage.py:generic-api-key:136
+2a225c26eb2a31c15dbc00b8e4e27baea6094cc8:tests/test_storage.py:generic-api-key:144
+
+# Intentional negative-test marker for rejecting inline private-key material.
+3c716c050c902c4effb7c0b6cd0cb3bb48af1f0c:tests/test_inventory.py:private-key:51
