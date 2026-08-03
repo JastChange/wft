@@ -1,4 +1,4 @@
-"""Batch executor (Gate B/Group D): concurrent dispatch + lease heartbeat.
+"""Batch executor (Gate B): concurrent dispatch + lease heartbeat + stale resume.
 
 Implements the Contract-02 -> dispatch -> Contract-03 commit -> Contract-05
 finalize path for the approved asyncssh/SQLite plan: a Run is created (with
@@ -6,8 +6,15 @@ idempotency), nodes execute the script concurrently bounded by the Contract-02
 ``global_concurrency`` semaphore and paced by ``connect_rate_per_sec``, each
 ExecutionResult is committed atomically under the run lease, and a final
 BatchSummary is persisted. A heartbeat renews the run lease; on loss the run
-cancels in-flight nodes and is left RUNNING for a future resumer. Stale-run
-resume/UNKNOWN recovery lands in a later release (after Group D).
+cancels in-flight nodes and is left RUNNING for a future resumer.
+
+``execute_run(..., resume=True)`` resumes a stale RUNNING run: the single
+``resume_run`` recovery transaction claims the lease and flips the leftover
+RUNNING checkpoints to UNKNOWN (per-node Contract-09 ``checkpoint_updated``),
+only PENDING/UNKNOWN nodes are re-dispatched (terminal nodes never re-run),
+``execution_uid`` stays stable from the first PENDING->RUNNING and attempts
+continue from ``max(attempt_seq)+1``, and the finalize aggregates every node
+(committed terminal + newly dispatched) into the BatchSummary.
 """
 from __future__ import annotations
 
@@ -132,6 +139,7 @@ async def execute_run(
     script: Script,
     known_hosts_path,
     lease_owner: str | None = None,
+    resume: bool = False,
 ) -> RunOutcome:
     """Run ``script`` on ``nodes`` concurrently and finalize with a Contract-05 summary.
 
@@ -144,29 +152,69 @@ async def execute_run(
     resumer; no authoritative summary exists). Every commit is fenced by
     ``lease_owner`` so an owner who lost the lease can never write execution/
     checkpoint/outbox/event against a reclaimed run.
+
+    With ``resume=True`` the run is already RUNNING: the recovery transaction
+    (``store.resume_run``) claims a stale lease and flips leftover RUNNING
+    checkpoints to UNKNOWN, only PENDING/UNKNOWN nodes are dispatched (terminal
+    nodes never re-run), and the finalize aggregates every original node --
+    committed terminal and newly dispatched -- into the Contract-05 summary.
     """
     # The lease owner must be unguessable per execution so a separate CLI
     # process cannot renew/resume this run's heartbeat with a shared "cli" tag.
     lease_owner = lease_owner or new_uuid7()
     limits = run_spec["payload"]["limits"]
-    started_at = now_iso()
     loop = asyncio.get_running_loop()
     start = loop.time()
 
-    if not store.start_run(
-        run_id,
-        lease_owner=lease_owner,
-        audit_event=build_event(
+    if resume:
+        # Single recovery transaction: stale 3-condition CAS + new owner + the
+        # leftover RUNNING checkpoints -> UNKNOWN with per-node checkpoint_updated
+        # events. None means the CAS refused (not RUNNING, not yet stale, or a
+        # live owner won the race); no state changed and nothing may proceed.
+        recovered = store.resume_run(
             run_id,
-            "run_started",
-            "run started",
-            data={"targeted": len(nodes)},
-        ),
-    ):
-        raise WFTError(
-            f"run {run_id}: could not start (expected QUEUED; "
-            "a RUNNING lease must go through resume, not a plain overwrite)"
+            lease_owner=lease_owner,
+            run_audit_event=build_event(
+                run_id,
+                "checkpoint_updated",
+                f"run resumed by owner {lease_owner[:8]}",
+                severity="warning",
+                data={"resume_count_bump": True},
+            ),
+            node_checkpoint_factory=lambda nid, uid: build_event(
+                run_id,
+                "checkpoint_updated",
+                f"node {nid} checkpoint -> UNKNOWN (resume)",
+                severity="warning",
+                node_id=nid,
+                execution_uid=uid,
+                data={"status": "UNKNOWN"},
+            ),
         )
+        if recovered is None:
+            raise WFTError(
+                f"run {run_id}: not resumable (must be RUNNING with a heartbeat "
+                "and lease stale past the lease window; a live owner or CAS "
+                "conflict refuses the resume)"
+            )
+        run_row = store.get_run(run_id) or {}
+        started_at = run_row.get("started_at") or now_iso()
+    else:
+        started_at = now_iso()
+        if not store.start_run(
+            run_id,
+            lease_owner=lease_owner,
+            audit_event=build_event(
+                run_id,
+                "run_started",
+                "run started",
+                data={"targeted": len(nodes)},
+            ),
+        ):
+            raise WFTError(
+                f"run {run_id}: could not start (expected QUEUED; "
+                "a RUNNING lease must go through resume, not a plain overwrite)"
+            )
 
     throttle = Throttle(
         global_concurrency=limits["global_concurrency"],
@@ -174,6 +222,14 @@ async def execute_run(
     )
     lease_lost = asyncio.Event()
     node_tasks: list[asyncio.Task] = []
+    task_by_id = {t["node_id"]: t for t in store.get_node_tasks(run_id)}
+    # Only writable checkpoints are dispatched: PENDING (first execution) and
+    # UNKNOWN (recovered by resume). Terminal nodes never re-run.
+    dispatch = [
+        (node, task_by_id[node["node_id"]])
+        for node in nodes
+        if task_by_id.get(node["node_id"], {}).get("status") in ("PENDING", "UNKNOWN")
+    ]
 
     async def heartbeat() -> None:
         # A heartbeat must tick even if tests monkeypatch asyncio.sleep into a
@@ -203,20 +259,28 @@ async def execute_run(
         finally:
             timer.cancel()
 
-    async def run_one(node: dict) -> _NodeOutcome | None:
+    async def run_one(node: dict, task: dict) -> _NodeOutcome | None:
         node_id = node["node_id"]
+        # execution_uid is stable for the whole logical execution: minted at the
+        # first PENDING->RUNNING and persisted on the checkpoint; a resumed
+        # (UNKNOWN) node reuses the same uid (crash recovery never invents a new
+        # one and never resets attempt_count).
+        resumed_node = task["status"] == "UNKNOWN"
+        execution_uid = task["execution_uid"] or new_uuid7()
         async with throttle.global_semaphore:
             if lease_lost.is_set():
                 return None
             try:
                 # The whole checkpoint -> execute -> commit boundary is one
                 # fenced critical section: a WFTLeaseLostError from any fenced
-                # write (checkpoint or commit) closes the run immediately -- set
-                # the lease-lost flag, cancel siblings, return no outcome.
+                # write (checkpoint, attempt, or commit) closes the run
+                # immediately -- set the lease-lost flag, cancel siblings,
+                # return no outcome.
                 if not store.set_node_task(
                     run_id,
                     node_id,
                     "RUNNING",
+                    execution_uid=execution_uid,
                     lease_owner=lease_owner,
                     event=build_event(
                         run_id,
@@ -224,6 +288,7 @@ async def execute_run(
                         f"node {node_id} started",
                         severity="debug",
                         node_id=node_id,
+                        execution_uid=execution_uid,
                     ),
                 ):
                     raise WFTError(
@@ -237,7 +302,10 @@ async def execute_run(
                     script,
                     known_hosts_path,
                     limits,
+                    execution_uid=execution_uid,
                     connect_limiter=throttle.connect_limiter,
+                    lease_owner=lease_owner,
+                    resumed=resumed_node,
                 )
                 if lease_lost.is_set():
                     return None
@@ -305,8 +373,8 @@ async def execute_run(
                 error_counts=error_counts,
             )
 
-    for node in nodes:
-        node_tasks.append(asyncio.create_task(run_one(node)))
+    for node, task in dispatch:
+        node_tasks.append(asyncio.create_task(run_one(node, task)))
     hb_task = asyncio.create_task(heartbeat())
     try:
         results = await asyncio.gather(*node_tasks, return_exceptions=True)
@@ -324,6 +392,20 @@ async def execute_run(
     finished_at = now_iso()
     duration_ms = int((loop.time() - start) * 1000)
     completed = [r for r in results if isinstance(r, _NodeOutcome)]
+    if resume:
+        # The BatchSummary must count every original node: already-terminal
+        # nodes (committed before the crash) are reconstructed from their
+        # persisted checkpoint + node_finished evidence and summed with the
+        # outcomes of the nodes dispatched by this resume.
+        finished_data = store.get_node_finished_data_map(run_id)
+        terminal = [
+            t for t in task_by_id.values()
+            if t["status"] in ("SUCCEEDED", "FAILED", "CANCELLED", "SKIPPED")
+        ]
+        completed += [
+            _outcome_from_terminal(t, finished_data.get(t["node_id"], {}))
+            for t in terminal
+        ]
     counts, error_counts, degraded, any_succeeded, any_failed = _aggregate(
         nodes, completed
     )
@@ -426,13 +508,56 @@ def _aggregate(
         if outcome.status == "SUCCEEDED":
             counts["succeeded"] += 1
             any_succeeded = True
-        else:
+        elif outcome.status == "FAILED":
             counts["failed"] += 1
             any_failed = True
+        elif outcome.status == "CANCELLED":
+            counts["cancelled"] += 1
+        elif outcome.status == "SKIPPED":
+            counts["skipped"] += 1
+        else:
+            counts["unknown"] += 1
         degraded = degraded or outcome.degraded
         for cls, count in outcome.error_counts.items():
             error_counts[cls] = error_counts.get(cls, 0) + count
     return counts, error_counts, degraded, any_succeeded, any_failed
+
+
+# Error classes that make a node outcome "degraded" (binary output / blob
+# fallback): the batch still ran with trustworthy per-node results.
+_DEGRADING_CLASSES = frozenset({"output_decode_failed", "blob_write_failed"})
+
+
+def _outcome_from_terminal(task: dict, finished_data: dict) -> _NodeOutcome:
+    """Reconstruct a terminal node's aggregation evidence for a resume finalize.
+
+    Nodes committed before a crash are never re-dispatched; their contribution
+    to the BatchSummary is rebuilt from the persisted checkpoint (primary
+    ``error_class``) plus the ``node_finished`` event's ``secondary_errors``
+    (per-class-once, matching ``_aggregate``'s order-independent counting).
+    """
+    primary = task["error_class"]
+    secondary = finished_data.get("secondary_errors") or []
+    error_counts: dict[str, int] = {}
+    counted: set[str] = set()
+    if primary:
+        error_counts[primary] = 1
+        counted.add(primary)
+    for sec in secondary:
+        cls = sec.get("class")
+        if cls and cls not in counted:
+            error_counts[cls] = 1
+            counted.add(cls)
+    degraded = (primary in _DEGRADING_CLASSES) or any(
+        s.get("class") in _DEGRADING_CLASSES for s in secondary
+    )
+    return _NodeOutcome(
+        node_id=task["node_id"],
+        status=task["status"],
+        degraded=degraded,
+        secondary_errors=tuple(secondary),
+        error_counts=error_counts,
+    )
 
 
 async def _execute_node(
@@ -442,33 +567,63 @@ async def _execute_node(
     script: Script,
     known_hosts_path,
     limits: dict,
+    *,
+    execution_uid: str,
     connect_limiter=None,
+    lease_owner: str | None = None,
+    resumed: bool = False,
 ) -> tuple[dict, bool, tuple[dict, ...], list[dict]]:
-    """Run one node with matrix-bounded retries.
+    """Run one node with matrix-bounded retries across crash boundaries.
 
     Returns ``(result_envelope, degraded, secondary_errors, attempts)`` where
     ``attempts`` is the per-attempt log for the ``attempts`` table and
     ``secondary_errors`` are blob/decode errors that could not fit the single
-    Contract-03 error slot. The Contract-03 result spans the whole logical
-    execution (first attempt start -> final attempt finish), while each attempt
-    keeps its own ``started_at``/``finished_at``. ``connect_limiter`` paces
-    every connection attempt (a retry reconnects, so each attempt waits).
+    Contract-03 error slot. ``execution_uid`` is fixed by the caller (minted at
+    the first PENDING->RUNNING and reused by a resume), so retries and resumed
+    executions share one logical execution. The Contract-03 result spans the
+    whole logical execution (first attempt start -> final attempt finish),
+    while each attempt keeps its own ``started_at``/``finished_at``. Every
+    attempt start/end is durably persisted under the ``lease_owner`` fence;
+    the attempt sequence continues from ``max(attempt_seq)+1`` so a crash never
+    resets ``attempt_count`` to 0 or duplicates an ``attempt_id``. When the
+    Contract-03 cap (3) is already consumed by persisted attempts, the terminal
+    FAILED outcome is reconstructed from the last attempt instead of running a
+    further SSH attempt. ``connect_limiter`` paces every connection attempt (a
+    retry reconnects, so each attempt waits).
     """
     node_id = node["node_id"]
-    execution_uid = new_uuid7()
     connect_timeout_sec = limits["connect_timeout_sec"]
     exec_timeout_sec = limits["exec_timeout_sec"]
-    attempt_count = 0
+    base_seq = store.get_attempt_max_seq(execution_uid)
     attempts: list[dict] = []
+    local_attempts = 0
     loop = asyncio.get_running_loop()
-    logical_started_at = now_iso()
     logical_start_loop = loop.time()
+    if base_seq > 0:
+        # A resumed execution spans the original first attempt start, not the
+        # resume time: Contract-03 ``started_at`` covers the whole logical run.
+        logical_started_at = store.get_first_attempt_started(execution_uid) or now_iso()
+    else:
+        logical_started_at = now_iso()
 
     while True:
-        attempt_count += 1
-        attempt_started = now_iso()
+        seq = base_seq + local_attempts + 1
+        if seq > 3:
+            # Contract-03 caps attempt_count at 3 for the whole logical
+            # execution: the retry budget is exhausted across the crash
+            # boundary, so reconstruct the terminal FAILED outcome from the
+            # last persisted attempt instead of running a 4th SSH attempt.
+            return _synthesize_exhausted(store, run_id, node, script, execution_uid)
         if connect_limiter is not None:
             await connect_limiter.wait()
+        local_attempts += 1
+        attempt_id = new_uuid7()
+        attempt_started = now_iso()
+        store.record_attempt(
+            run_id, node_id, execution_uid,
+            attempt_id=attempt_id, attempt_seq=seq, status="RUNNING",
+            started_at=attempt_started, lease_owner=lease_owner,
+        )
         outcome = await execute_script(
             node=node,
             script=script,
@@ -481,26 +636,43 @@ async def _execute_node(
         if outcome.error is not None:
             error = outcome.error
             attempts.append(
-                _attempt_record(attempt_count, "FAILED", error, attempt_started, attempt_finished)
+                _attempt_record(attempt_id, seq, "FAILED", error, attempt_started, attempt_finished)
             )
-            if should_retry(error["class"], attempt_count):
-                await asyncio.sleep(backoff_seconds(error["class"], attempt_count))
+            store.record_attempt(
+                run_id, node_id, execution_uid,
+                attempt_id=attempt_id, attempt_seq=seq, status="FAILED",
+                started_at=attempt_started, finished_at=attempt_finished,
+                error=error, lease_owner=lease_owner,
+            )
+            if should_retry(error["class"], seq):
+                await asyncio.sleep(backoff_seconds(error["class"], seq))
                 continue
             status, final_error = "FAILED", error
         else:
             status, final_error = classify_exit(outcome.exit_code, script.expected_exit_codes)
             attempts.append(
-                _attempt_record(attempt_count, status, final_error, attempt_started, attempt_finished)
+                _attempt_record(attempt_id, seq, status, final_error, attempt_started, attempt_finished)
+            )
+            store.record_attempt(
+                run_id, node_id, execution_uid,
+                attempt_id=attempt_id, attempt_seq=seq, status=status,
+                started_at=attempt_started, finished_at=attempt_finished,
+                error=final_error, lease_owner=lease_owner,
             )
 
         logical_finished_at = now_iso()
+        extra_flags: list[str] = []
+        if resumed:
+            extra_flags.append("resumed")
+        if local_attempts > 1:
+            extra_flags.append("retried")
         result, degraded, secondary_errors = build_execution_result(
             run_id=run_id,
             execution_uid=execution_uid,
             node_id=node_id,
             script=script,
             status=status,
-            attempt_count=attempt_count,
+            attempt_count=seq,
             started_at=logical_started_at,
             finished_at=logical_finished_at,
             duration_ms=int((loop.time() - logical_start_loop) * 1000),
@@ -513,12 +685,58 @@ async def _execute_node(
             stderr_valid_utf8=outcome.stderr_valid_utf8,
             error=final_error,
             blobs=store.blobs,
-            extra_flags=("retried",) if attempt_count > 1 else (),
+            extra_flags=tuple(extra_flags),
         )
         return result, degraded, secondary_errors, attempts
 
 
+def _synthesize_exhausted(
+    store: Store,
+    run_id: str,
+    node: dict,
+    script: Script,
+    execution_uid: str,
+) -> tuple[dict, bool, tuple[dict, ...], list[dict]]:
+    """Reconstruct a terminal FAILED result when persisted attempts used up the cap.
+
+    When a crash/resume boundary has already consumed the Contract-03 budget
+    (``attempt_count`` capped at 3) there is no trustworthy SSH output to
+    report, only the last persisted attempt's error. The result is FAILED with
+    that error, empty streams, and the cumulative attempt_count -- never a 4th
+    attempt and never a reset to 0.
+    """
+    last = store.get_last_attempt(execution_uid)
+    error = {
+        "class": last["error_class"],
+        "category": last["error_category"],
+        "message": last["error_message"],
+        "retryable": bool(last["retryable"]),
+    }
+    started_at = last["started_at"]
+    finished_at = last["finished_at"] or started_at
+    result, _, secondary = build_execution_result(
+        run_id=run_id,
+        execution_uid=execution_uid,
+        node_id=node["node_id"],
+        script=script,
+        status="FAILED",
+        attempt_count=last["attempt_seq"],
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_ms=0,
+        exit_code=None,
+        stdout_bytes=b"",
+        stderr_bytes=b"",
+        error=error,
+        blobs=store.blobs,
+        extra_flags=("resumed",),
+    )
+    degraded = last["error_class"] in _DEGRADING_CLASSES
+    return result, degraded, secondary, []
+
+
 def _attempt_record(
+    attempt_id: str,
     attempt_seq: int,
     status: str,
     error: dict | None,
@@ -526,7 +744,7 @@ def _attempt_record(
     finished_at: str,
 ) -> dict:
     return {
-        "attempt_id": new_uuid7(),
+        "attempt_id": attempt_id,
         "attempt_seq": attempt_seq,
         "status": status,
         "error_class": (error or {}).get("class"),
