@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "schema_name": "contract-09-run-event",
+    "schema_version": "1.0.0",
+    "producer": "test",
+    "created_at": "2026-08-03T10:00:00+00:00",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "stage": "orchestration"
+  },
+  "payload": {
+    "event_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "event_type": "something_else",
+    "severity": "info",
+    "occurred_at": "2026-08-03T10:00:00+00:00",
+    "message": "run created",
+    "data": {}
+  }
+}

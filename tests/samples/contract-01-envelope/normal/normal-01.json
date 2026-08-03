@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "schema_name": "contract-01-envelope",
+    "schema_version": "1.0.0",
+    "producer": "test",
+    "created_at": "2026-08-03T10:00:00+00:00",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "stage": "trigger"
+  },
+  "payload": {
+    "note": "anything"
+  }
+}

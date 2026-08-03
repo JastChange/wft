@@ -1,0 +1,9 @@
+# Example global WFT configuration. No secret bodies here.
+data_dir: ./data
+logs_dir: ./logs
+log_level: INFO
+vault_dir: null          # Obsidian Vault absolute path (configured later)
+known_hosts_path: ./data/known_hosts
+audit_path: ./logs/audit.jsonl
+# inventory_path: ./config/inventory.yaml
+# scripts_path: ./config/scripts.yaml

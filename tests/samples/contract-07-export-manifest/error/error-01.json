@@ -1,0 +1,25 @@
+{
+  "meta": {
+    "schema_name": "contract-07-export-manifest",
+    "schema_version": "1.0.0",
+    "producer": "test",
+    "created_at": "2026-08-03T10:00:00+00:00",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "stage": "export"
+  },
+  "payload": {
+    "export_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "status": "exported",
+    "started_at": "2026-08-03T10:00:00+00:00",
+    "finished_at": "2026-08-03T10:01:05+00:00",
+    "files": [
+      {
+        "path": "a.md",
+        "note_type": "run",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "status": "written"
+      }
+    ]
+  }
+}

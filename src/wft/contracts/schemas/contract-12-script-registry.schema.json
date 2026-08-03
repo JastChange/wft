@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wft.local/contracts/contract-12-script-registry/1.0.0",
+  "title": "Contract-12 ScriptRegistry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["meta", "payload"],
+  "properties": {
+    "meta": { "$ref": "contract-01-envelope.schema.json#/$defs/meta" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scripts"],
+      "properties": {
+        "scripts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "path", "sha256", "risk", "shell", "timeout_sec", "enabled"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$" },
+              "path": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "sha256": { "$ref": "contract-01-envelope.schema.json#/$defs/sha256" },
+              "display_ref": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}@[a-f0-9]{12,64}$" },
+              "risk": { "type": "string", "const": "read_only" },
+              "shell": { "type": "string", "enum": ["sh", "bash", "zsh", "python3"] },
+              "timeout_sec": { "type": "integer", "minimum": 1, "maximum": 86400 },
+              "expected_exit_codes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 255 }, "default": [0] },
+              "enabled": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

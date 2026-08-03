@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wft.local/contracts/contract-08-note-frontmatter/1.0.0",
+  "title": "Contract-08 NoteFrontmatter",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["managed_by", "wf_schema", "note_type", "run_id", "created_at", "status", "tags"],
+  "properties": {
+    "managed_by": { "const": "wft" },
+    "wf_schema": { "const": "note-frontmatter/1.0.0" },
+    "note_type": { "type": "string", "enum": ["run", "node", "service", "dashboard"] },
+    "run_id": { "$ref": "contract-01-envelope.schema.json#/$defs/run_id" },
+    "node_id": { "$ref": "contract-01-envelope.schema.json#/$defs/node_id" },
+    "script_name": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$" },
+    "script_sha256": { "$ref": "contract-01-envelope.schema.json#/$defs/sha256" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "status": { "type": "string", "enum": ["success", "partial", "failed", "aborted", "degraded"] },
+    "tags": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 64 } },
+    "managed_hash": { "$ref": "contract-01-envelope.schema.json#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "note_type": { "const": "node" } } },
+      "then": { "required": ["node_id"] }
+    }
+  ]
+}

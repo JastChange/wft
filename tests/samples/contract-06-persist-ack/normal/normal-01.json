@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "schema_name": "contract-06-persist-ack",
+    "schema_version": "1.0.0",
+    "producer": "test",
+    "created_at": "2026-08-03T10:00:00+00:00",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "stage": "persistence"
+  },
+  "payload": {
+    "object_type": "execution_result",
+    "object_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "committed_at": "2026-08-03T10:00:00+00:00",
+    "storage_version": 1,
+    "outbox_event_ids": [
+      "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    ]
+  }
+}

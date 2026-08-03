@@ -1,0 +1,36 @@
+{
+  "meta": {
+    "schema_name": "contract-05-batch-summary",
+    "schema_version": "1.0.0",
+    "producer": "test",
+    "created_at": "2026-08-03T10:00:00+00:00",
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "stage": "orchestration"
+  },
+  "payload": {
+    "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "run_status": "DEGRADED",
+    "batch_status": "partial",
+    "summary_revision": 1,
+    "final": true,
+    "counts": {
+      "targeted": 5,
+      "succeeded": 4,
+      "failed": 1,
+      "unknown": 0,
+      "cancelled": 0,
+      "skipped": 0
+    },
+    "error_counts": {
+      "conn_refused": 1
+    },
+    "top_anomalies": [
+      "node-b: connection refused"
+    ],
+    "started_at": "2026-08-03T10:00:00+00:00",
+    "finished_at": "2026-08-03T10:01:00+00:00",
+    "duration_ms": 60000,
+    "report_path": "reports/run.json",
+    "exit_code": 1
+  }
+}

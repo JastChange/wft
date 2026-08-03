@@ -1,0 +1,19 @@
+# Example read-only script registry — Contract-12 payload shape.
+# Only read_only scripts are accepted in MVP (AC-008B). `sha256` must match the
+# actual file content; run `wft script check --file config/scripts.example.yaml`
+# to verify. `path` is relative to this file's directory and must stay inside it.
+scripts:
+  - name: disk-usage
+    path: ../scripts/disk_usage.sh
+    sha256: b7d11de11f00c03725522c110988104e25e5a8e1f53001a0c74b75732c70bc37
+    risk: read_only
+    shell: bash
+    timeout_sec: 30
+    enabled: true
+  - name: load-average
+    path: ../scripts/load_average.sh
+    sha256: 221eaaae18b254fb594c28d942c8723ada77dfc39da786e7176fc14704a91875
+    risk: read_only
+    shell: bash
+    timeout_sec: 30
+    enabled: true

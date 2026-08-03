@@ -1,0 +1,16 @@
+{
+  "managed_by": "wft",
+  "wf_schema": "note-frontmatter/1.0.0",
+  "note_type": "node",
+  "run_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "created_at": "2026-08-03T10:00:00+00:00",
+  "status": "partial",
+  "tags": [
+    "wft",
+    "disk"
+  ],
+  "node_id": "node-a",
+  "script_name": "disk-usage",
+  "script_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "managed_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

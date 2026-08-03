@@ -1,0 +1,25 @@
+"""Exception types used across WFT modules."""
+
+
+class WFTError(Exception):
+    """Base error for all WFT failures."""
+
+
+class WFTContractError(WFTError):
+    """A payload violated a contract's JSON Schema or semantic rules."""
+
+
+class WFTConfigError(WFTError):
+    """A configuration file is malformed, invalid, or self-inconsistent."""
+
+
+class WFTInventoryError(WFTConfigError):
+    """An inventory file failed schema or semantic validation."""
+
+
+class WFTScriptRegistryError(WFTConfigError):
+    """A script registry entry is invalid or its file hash does not match."""
+
+
+class WFTUserError(WFTError):
+    """Raised for user-facing input problems that should exit with code 2."""
