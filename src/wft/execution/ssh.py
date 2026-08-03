@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import asyncssh
+from asyncssh.sftp import SFTPAttrs
 
 from wft.contracts.errors import WFTExecutionError
 from wft.execution.result import STREAM_HARD_CAP
@@ -99,6 +100,10 @@ async def execute_script(
         except (asyncssh.Error, OSError):
             pass
         conn.close()
+        try:
+            await conn.wait_closed()
+        except (asyncssh.Error, OSError):
+            pass
     outcome.duration_ms = int((asyncio.get_running_loop().time() - start) * 1000)
     return outcome
 
@@ -111,9 +116,23 @@ async def _run_remote(
     exec_timeout_sec: int,
 ) -> ExecutionOutcome:
     try:
+        script_bytes = script.path.read_bytes()
+    except OSError as exc:
+        return ExecutionOutcome(
+            error=error_dict("upload_failed", f"cannot read {script.path}: {exc}")
+        )
+    try:
+        # Exclusive 0600 create: the file never exists with weaker permissions,
+        # so a concurrent reader cannot observe a partially-written script.
         async with conn.start_sftp_client() as sftp:
-            await sftp.put(script.path, remotepath=remote_path)
-            await sftp.chmod(remote_path, 0o600)
+            file = await sftp.open(
+                remote_path,
+                asyncssh.FXF_WRITE | asyncssh.FXF_CREAT | asyncssh.FXF_EXCL,
+                attrs=SFTPAttrs(permissions=0o600),
+                encoding=None,
+            )
+            async with file:
+                await file.write(script_bytes)
     except (asyncssh.Error, OSError) as exc:
         return ExecutionOutcome(error=error_dict("upload_failed", str(exc)))
 

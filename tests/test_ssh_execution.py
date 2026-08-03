@@ -136,6 +136,27 @@ def test_large_output_keeps_tail_and_tracks_total(tmp_path: Path) -> None:
     assert outcome.stdout == b"a" * STREAM_HARD_CAP
 
 
+def test_uploaded_script_is_0600(tmp_path: Path) -> None:
+    # The script must be uploaded via exclusive 0600 create: a reader should
+    # never observe it with weaker permissions or half-written.
+    script_path = tmp_path / "stat_self.sh"
+    script_path.write_text("#!/bin/bash\nstat -f '%Lp' \"$0\"\n", encoding="utf-8")
+    script = _script(script_path)
+
+    outcome = _run_server_and(
+        lambda host, port, key_path, known_hosts_path: execute_script(
+            node=_node(host, port, key_path=key_path),
+            script=script,
+            known_hosts_path=known_hosts_path,
+            connect_timeout_sec=5,
+            exec_timeout_sec=10,
+        ),
+        tmp_path,
+    )
+    assert outcome.error is None
+    assert outcome.stdout == b"600\n"
+
+
 def test_nonzero_exit_captured(tmp_path: Path) -> None:
     script_path = tmp_path / "boom.sh"
     script_path.write_text("#!/bin/bash\necho out\necho boom >&2\nexit 3\n", encoding="utf-8")
