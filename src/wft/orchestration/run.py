@@ -189,8 +189,18 @@ async def execute_run(
         else:
             counts["failed"] += 1
             any_failed = True
-            error_class = (payload.get("error") or {}).get("class", "unknown")
-            error_counts[error_class] = error_counts.get(error_class, 0) + 1
+        error = payload.get("error")
+        if error is not None and error["class"] != "output_decode_failed":
+            error_counts[error["class"]] = error_counts.get(error["class"], 0) + 1
+        if (
+            payload["stdout"].get("encoding") == "binary"
+            or payload["stderr"].get("encoding") == "binary"
+        ):
+            # Aggregate evidence for binary output even when the result already
+            # carries a primary failure error (错误矩阵_v0.1.md output_decode_failed).
+            error_counts["output_decode_failed"] = (
+                error_counts.get("output_decode_failed", 0) + 1
+            )
 
         store.commit_execution_result(
             run_id,

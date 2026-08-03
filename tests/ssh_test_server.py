@@ -150,13 +150,10 @@ async def _run_command(process: asyncssh.SSHServerProcess) -> None:
             stderr=asyncio.subprocess.PIPE,
         )
         out, err = await proc.communicate()
-        encoding, _ = process.channel.get_encoding()
-        if encoding is None:
-            process.stdout.write(out)
-            process.stderr.write(err)
-        else:
-            process.stdout.write(out.decode("utf-8", "replace"))
-            process.stderr.write(err.decode("utf-8", "replace"))
+        # The server runs with encoding=None so raw bytes are transmitted
+        # unchanged, emulating a real sshd (binary script output must survive).
+        process.stdout.write(out)
+        process.stderr.write(err)
         process.exit(proc.returncode)
     except Exception:  # never let a broken command kill the server
         try:
@@ -190,6 +187,7 @@ class RunningServer:
             sftp_factory=_LocalSFTPServer,
             sftp_version=6,
             allow_scp=False,
+            encoding=None,
         )
         self.port = self._server.sockets[0].getsockname()[1]
         return self

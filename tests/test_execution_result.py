@@ -65,51 +65,54 @@ def _build(blobs: BlobStore, **overrides) -> tuple[dict, bool]:
 
 
 def test_small_stdout_inlined(blobs: BlobStore) -> None:
-    stream, flags, degraded = build_stream("stdout", b"hello", blobs)
+    stream, flags, degraded, err = build_stream("stdout", b"hello", blobs)
     assert stream["inline"] == "hello"
     assert stream["bytes"] == 5
     assert stream["truncated"] is False
     assert stream["encoding"] == "utf-8"
     assert flags == []
     assert degraded is False
+    assert err is None
 
 
 def test_stdout_overflow_goes_to_blob(blobs: BlobStore) -> None:
     big = b"x" * (INLINE_STDOUT_CAP + 1024)
-    stream, flags, degraded = build_stream("stdout", big, blobs)
+    stream, flags, degraded, err = build_stream("stdout", big, blobs)
     assert "inline" not in stream
     assert blobs.contains(stream["blob_ref"])
     assert stream["bytes"] == len(big)
     assert stream["truncated"] is False
     assert flags == []
     assert degraded is False
+    assert err is None
 
 
 def test_stderr_cap_is_smaller(blobs: BlobStore) -> None:
     # Between stdout and stderr caps: inlined for stdout, spilled for stderr.
     size = INLINE_STDERR_CAP + 1024
     assert size < INLINE_STDOUT_CAP
-    out_stream, _, _ = build_stream("stdout", b"y" * size, blobs)
-    err_stream, _, _ = build_stream("stderr", b"y" * size, blobs)
+    out_stream, _, _, _ = build_stream("stdout", b"y" * size, blobs)
+    err_stream, _, _, _ = build_stream("stderr", b"y" * size, blobs)
     assert "inline" in out_stream
     assert "blob_ref" in err_stream
 
 
 def test_hard_cap_truncates_tail(blobs: BlobStore) -> None:
     data = b"Z" * (STREAM_HARD_CAP + 5000)
-    stream, flags, degraded = build_stream("stdout", data, blobs)
+    stream, flags, degraded, err = build_stream("stdout", data, blobs)
     assert stream["bytes"] == STREAM_HARD_CAP
     assert stream["truncated"] is True
     assert "truncated" in flags
     assert "output_overflow" in flags
     assert degraded is False
+    assert err is None
 
 
 def test_pre_capped_tail_reports_total_overflow(blobs: BlobStore) -> None:
     # The SSH layer already capped the tail to the hard cap; the original total
     # (which exceeds the cap) must still mark the stream truncated.
     tail = b"Z" * STREAM_HARD_CAP
-    stream, flags, degraded = build_stream(
+    stream, flags, degraded, err = build_stream(
         "stdout", tail, blobs, total_bytes=STREAM_HARD_CAP + 5000
     )
     assert stream["bytes"] == STREAM_HARD_CAP
@@ -117,15 +120,48 @@ def test_pre_capped_tail_reports_total_overflow(blobs: BlobStore) -> None:
     assert "truncated" in flags
     assert "output_overflow" in flags
     assert degraded is False
+    assert err is None
 
 
 def test_non_utf8_binary_blob_degrades(blobs: BlobStore) -> None:
     data = b"\xff\xfe binary \x00 bytes"
-    stream, flags, degraded = build_stream("stdout", data, blobs)
+    stream, flags, degraded, err = build_stream("stdout", data, blobs)
     assert stream["encoding"] == "binary"
     assert "blob_ref" in stream
     assert blobs.read(stream["blob_ref"]) == data
     assert degraded is True
+    assert err is None
+
+
+class _WriteFails(BlobStore):
+    def write(self, data: bytes) -> str:
+        raise OSError("disk full")
+
+
+def test_blob_write_failure_utf8_falls_back_to_inline(blobs: BlobStore) -> None:
+    # Over-cap UTF-8: a blob write failure must truncate to the inline cap and
+    # degrade the run instead of failing it (错误矩阵_v0.1.md blob_write_failed).
+    data = b"y" * (INLINE_STDOUT_CAP + 1024)
+    stream, flags, degraded, err = build_stream("stdout", data, _WriteFails(blobs.blob_dir))
+    assert stream is not None
+    assert stream["inline"] == "y" * INLINE_STDOUT_CAP
+    assert stream["truncated"] is True
+    assert "output_overflow" in flags
+    assert degraded is True
+    assert err["class"] == "blob_write_failed"
+    assert err["category"] == "RESOURCE"
+    assert err["retryable"] is True
+
+
+def test_blob_write_failure_binary_is_unrecoverable(blobs: BlobStore) -> None:
+    # Binary output cannot be inlined, so a blob write failure must signal the
+    # caller to mark the result FAILED.
+    stream, flags, degraded, err = build_stream(
+        "stdout", b"\xff\x00\x01", _WriteFails(blobs.blob_dir)
+    )
+    assert stream is None
+    assert degraded is True
+    assert err["class"] == "blob_write_failed"
 
 
 # ------------------------------------------------------------ classify_exit
@@ -190,6 +226,42 @@ def test_overflow_flag_propagates_to_result(blobs: BlobStore) -> None:
 def test_binary_output_degrades_run(blobs: BlobStore) -> None:
     env, degraded = _build(blobs, stderr_bytes=b"\x00\x01\xff")
     assert env["payload"]["stderr"]["encoding"] == "binary"
+    assert degraded is True
+
+
+def test_binary_output_attaches_decode_error(blobs: BlobStore) -> None:
+    # A SUCCEEDED result with binary output carries structured output_decode_failed
+    # evidence so batch aggregation can count it (错误矩阵_v0.1.md).
+    env, degraded = _build(blobs, stderr_bytes=b"\x00\x01\xff")
+    assert env["payload"]["status"] == "SUCCEEDED"
+    assert env["payload"]["error"]["class"] == "output_decode_failed"
+    assert env["payload"]["error"]["category"] == "DATA"
+    assert env["payload"]["error"]["retryable"] is False
+    assert degraded is True
+
+
+def test_binary_output_keeps_primary_error(blobs: BlobStore) -> None:
+    from wft.execution.errors import error_dict
+
+    env, degraded = _build(
+        blobs,
+        status="FAILED",
+        exit_code=1,
+        error=error_dict("exec_nonzero", "script exited 1"),
+        stderr_bytes=b"\x00\x01\xff",
+    )
+    assert env["payload"]["status"] == "FAILED"
+    assert env["payload"]["error"]["class"] == "exec_nonzero"
+    assert env["payload"]["stderr"]["encoding"] == "binary"
+    assert degraded is True
+
+
+def test_hard_blob_failure_marks_result_failed(blobs: BlobStore) -> None:
+    # A stream that cannot be inlined (binary) failing to persist is FAILED with
+    # blob_write_failed regardless of the exit status.
+    env, degraded = _build(_WriteFails(blobs.blob_dir), stderr_bytes=b"\x00\x01\xff")
+    assert env["payload"]["status"] == "FAILED"
+    assert env["payload"]["error"]["class"] == "blob_write_failed"
     assert degraded is True
 
 

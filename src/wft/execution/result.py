@@ -34,16 +34,33 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _inline_empty() -> dict:
+    """An empty UTF-8 stream used when a hard blob failure dropped the output."""
+    return {
+        "inline": "",
+        "bytes": 0,
+        "truncated": False,
+        "sha256": _sha(b""),
+        "encoding": "utf-8",
+    }
+
+
 def build_stream(
     name: str,
     data: bytes,
     blobs: BlobStore,
     total_bytes: int | None = None,
-) -> tuple[dict, list[str], bool]:
-    """Return ``(stream_dict, flags, degraded)`` for a stdout/stderr stream.
+) -> tuple[dict | None, list[str], bool, dict | None]:
+    """Return ``(stream, flags, degraded, error)`` for a stdout/stderr stream.
 
-    ``degraded`` is True when the bytes are not valid UTF-8 (binary content),
-    which the caller must propagate to the run-level status. When the SSH layer
+    ``stream`` is ``None`` only when a stream that cannot be inlined (binary)
+    failed to persist to a blob — the caller must then mark the whole result
+    FAILED (错误矩阵_v0.1.md: ``blob_write_failed``). For over-cap UTF-8 the
+    fallback truncates to the inline cap and degrades instead of failing.
+
+    ``degraded`` is True for non-UTF-8 (binary) content or when a blob write
+    failed and the stream had to fall back. ``error`` is a ``blob_write_failed``
+    error dict when a blob write failed, else ``None``. When the SSH layer
     already capped the tail (``total_bytes`` > the data length), ``truncated``
     is decided from the original total instead of the capped ``data``.
     """
@@ -62,7 +79,13 @@ def build_stream(
         flags.extend(["truncated", "output_overflow"])
 
     if encoding == "binary":
-        blob_ref = blobs.write(content)
+        try:
+            blob_ref = blobs.write(content)
+        except OSError as exc:
+            return None, flags, True, error_dict(
+                "blob_write_failed",
+                f"cannot persist binary {name} to blob: {exc}",
+            )
         return (
             {
                 "blob_ref": blob_ref,
@@ -73,6 +96,7 @@ def build_stream(
             },
             flags,
             True,
+            None,
         )
     if len(content) <= inline_cap:
         return (
@@ -85,8 +109,29 @@ def build_stream(
             },
             flags,
             False,
+            None,
         )
-    blob_ref = blobs.write(content)
+    try:
+        blob_ref = blobs.write(content)
+    except OSError as exc:
+        fallback = content[-inline_cap:]
+        if "truncated" not in flags:
+            flags.extend(["truncated", "output_overflow"])
+        return (
+            {
+                "inline": fallback.decode("utf-8"),
+                "bytes": len(fallback),
+                "truncated": True,
+                "sha256": _sha(fallback),
+                "encoding": "utf-8",
+            },
+            flags,
+            True,
+            error_dict(
+                "blob_write_failed",
+                f"blob write failed; {name} truncated to {inline_cap} bytes inline: {exc}",
+            ),
+        )
     return (
         {
             "blob_ref": blob_ref,
@@ -97,6 +142,7 @@ def build_stream(
         },
         flags,
         False,
+        None,
     )
 
 
@@ -140,16 +186,35 @@ def build_execution_result(
     then treat the run as DEGRADED. Raises :class:`WFTContractError` if the
     built envelope fails Contract-03 validation (a developer bug).
     """
-    stdout_stream, stdout_flags, stdout_degraded = build_stream(
+    stdout_stream, stdout_flags, stdout_degraded, stdout_err = build_stream(
         "stdout", stdout_bytes, blobs, total_bytes=stdout_total
     )
-    stderr_stream, stderr_flags, stderr_degraded = build_stream(
+    stderr_stream, stderr_flags, stderr_degraded, stderr_err = build_stream(
         "stderr", stderr_bytes, blobs, total_bytes=stderr_total
     )
     flags = sorted(set([*stdout_flags, *stderr_flags, *extra_flags]))
     unknown = set(flags) - FLAG_VALUES
     if unknown:
         raise ValueError(f"unknown result flags: {sorted(unknown)}")
+
+    degraded = stdout_degraded or stderr_degraded
+    if stdout_stream is None or stderr_stream is None:
+        # A stream that cannot be inlined (binary) failed to persist to a blob:
+        # the output is lost, so the result must be FAILED (错误矩阵_v0.1.md).
+        status = "FAILED"
+        degraded = True
+        if error is None:
+            error = stdout_err or stderr_err
+        if stdout_stream is None:
+            stdout_stream = _inline_empty()
+        if stderr_stream is None:
+            stderr_stream = _inline_empty()
+    elif degraded and error is None:
+        # Structured evidence for binary output: degrade the result and attach
+        # an output_decode_failed error so batch aggregation can count it.
+        error = error_dict(
+            "output_decode_failed", "script output is not valid UTF-8 (binary content)"
+        )
 
     payload: dict = {
         "execution_uid": execution_uid,

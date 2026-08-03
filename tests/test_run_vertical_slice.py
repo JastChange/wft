@@ -327,6 +327,26 @@ def test_failure_execution_persisted(tmp_path: Path) -> None:
     _assert_summary_persisted(store, run_id, "SUCCESS", "failed")
 
 
+def test_binary_output_aggregates_decode_evidence(tmp_path: Path) -> None:
+    """Binary stdout degrades the run and counts output_decode_failed (item 5)."""
+    store, run_id, outcome = _run_and_execute(
+        tmp_path, "#!/bin/bash\nprintf '\\xff\\xfe\\x00\\x01'\nexit 0\n"
+    )
+    assert outcome.run_status == "DEGRADED"
+    assert outcome.batch_status == "success"
+    assert outcome.exit_code == 1
+    assert outcome.error_counts == {"output_decode_failed": 1}
+
+    with store.database.connect_migrated() as conn:
+        row = conn.execute(
+            "SELECT status, error_json, stdout_json FROM executions WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert row["status"] == "SUCCEEDED"
+        assert json.loads(row["error_json"])["class"] == "output_decode_failed"
+        assert json.loads(row["stdout_json"])["encoding"] == "binary"
+
+
 def test_transient_error_retries_then_succeeds(tmp_path: Path, monkeypatch) -> None:
     script_path = tmp_path / "ok.sh"
     script_path.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
@@ -422,6 +442,7 @@ class ThreadedSSHServer:
             sftp_factory=_LocalSFTPServer,
             sftp_version=6,
             allow_scp=False,
+            encoding=None,
         )
         self.port = self._server.sockets[0].getsockname()[1]
         ready.set()
