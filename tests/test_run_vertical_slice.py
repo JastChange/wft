@@ -788,3 +788,258 @@ def test_cli_run_help_mentions_options() -> None:
     assert callable(getattr(args, "handler", None))
     assert args.group == []
     assert args.tag == []
+
+
+# ---------------------------------------------------------- crash / resume
+
+
+def _seed_config(tmp_path: Path) -> tuple[Path, Store]:
+    data_dir = tmp_path / "data"
+    config = tmp_path / "wft.yaml"
+    config.write_text(f"data_dir: {data_dir}\n", encoding="utf-8")
+    return config, Store(Database(data_dir / "wft.db"))
+
+
+def test_cli_run_resume_mutex_rejects_new_run_args(tmp_path: Path) -> None:
+    """--resume is mutually exclusive with every new-run arg (exit 2)."""
+    for extra in (
+        ("--inventory", "inv.yaml"),
+        ("--script", "ok"),
+        ("--group", "web"),
+        ("--tag", "prod"),
+        ("--idempotency-key", "k"),
+    ):
+        proc = run_cli("run", "--resume", "01HX0" + "A" * 21, *extra)
+        assert proc.returncode == 2, extra
+        assert "mutually exclusive" in proc.stderr
+
+
+def test_cli_run_resume_nonexistent_run_exit_two(tmp_path: Path) -> None:
+    config, _ = _seed_config(tmp_path)
+    proc = run_cli("run", "--resume", "01HX0" + "A" * 21, "--config", str(config))
+    assert proc.returncode == 2
+    assert "no such run" in proc.stderr
+
+
+def test_cli_run_resume_non_running_run_exit_two(tmp_path: Path) -> None:
+    config, store = _seed_config(tmp_path)
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+    spec = _make_run_spec(_script(script_path), [])
+    run_id, _ = create_run(store, spec, ["node-a"])
+    # QUEUED (never started) is not RUNNING: resume must refuse.
+    proc = run_cli("run", "--resume", run_id, "--config", str(config))
+    assert proc.returncode == 2
+    assert "only RUNNING runs can be resumed" in proc.stderr
+    # No state side effect: still QUEUED, no events written by the resume.
+    assert store.get_run(run_id)["status"] == "QUEUED"
+
+
+def test_cli_run_resume_not_stale_exit_two(tmp_path: Path) -> None:
+    config, store = _seed_config(tmp_path)
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+    spec = _make_run_spec(_script(script_path), [])
+    run_id, _ = create_run(store, spec, ["node-a"])
+    assert store.start_run(run_id, lease_owner="worker-1")
+    # Fresh heartbeat/lease: a live owner holds the run, no state may change.
+    proc = run_cli("run", "--resume", run_id, "--config", str(config))
+    assert proc.returncode == 2
+    assert "lease not yet stale" in proc.stderr
+    assert store.get_run(run_id)["lease_owner"] == "worker-1"
+    assert store.get_run(run_id)["resume_count"] == 0
+
+
+def test_cli_run_resume_stale_but_unrecoverable_script_exit_two(tmp_path: Path) -> None:
+    """A stale run whose script is unrecoverable exits 2 before the lock claim."""
+    config, store = _seed_config(tmp_path)
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+    spec = _make_run_spec(_script(script_path), [])
+    run_id, _ = create_run(store, spec, ["node-a"])
+    assert store.start_run(run_id, lease_owner="worker-1")
+    _age_run_lease(store, run_id)
+    # Missing script registry -> the recorded script cannot be resolved.
+    proc = run_cli("run", "--resume", run_id, "--config", str(config),
+                   "--scripts", str(tmp_path / "missing-scripts.yaml"))
+    assert proc.returncode == 2
+    # The recovery CAS was never attempted: owner and resume_count unchanged.
+    assert store.get_run(run_id)["lease_owner"] == "worker-1"
+    assert store.get_run(run_id)["resume_count"] == 0
+
+
+def test_cli_run_resume_after_kill9_recovers_stale_run(tmp_path: Path) -> None:
+    """A SIGKILLed run is resumed: committed nodes never re-run, leftover RUNNING
+    is marked UNKNOWN then re-run, PENDING continues, and run_id/execution_uid
+    stay stable with the full audit chain and correct final counts."""
+    import time
+
+    with ThreadedSSHServer(tmp_path) as server:
+        marker = tmp_path / "marker-a"
+        # First execution touches the marker then blocks; a resumed execution
+        # sees the marker and exits 0 immediately (proves the re-run happened).
+        script_path = tmp_path / "ok.sh"
+        script_path.write_text(
+            f"if [ -f {marker} ]; then echo done; exit 0; fi\n"
+            f"touch {marker}\n"
+            "echo started\n"
+            "sleep 60\n",
+            encoding="utf-8",
+        )
+        config = tmp_path / "wft.yaml"
+        data_dir = tmp_path / "data"
+        config.write_text(f"data_dir: {data_dir}\n", encoding="utf-8")
+        known_hosts = tmp_path / "known_hosts"
+        _known_hosts(known_hosts, "127.0.0.1", server.port, server._host_key)
+        inventory = tmp_path / "inventory.yaml"
+        inventory.write_text(
+            "nodes:\n"
+            "  - node_id: node-a\n"
+            f"    host: 127.0.0.1\n    port: {server.port}\n"
+            "    username: tester\n"
+            "    auth:\n"
+            "      method: key\n"
+            f"      credential_ref: file://{server.client_key_path}\n"
+            "    groups: [web]\n"
+            "    tags: []\n"
+            # node-b fails deterministically and instantly: a missing password
+            # secret raises secret_resolution_failed synchronously (PERMANENT,
+            # 1 attempt, no retry) before any connection is attempted.
+            "  - node_id: node-b\n"
+            f"    host: 127.0.0.1\n    port: {server.port}\n"
+            "    username: tester\n"
+            "    auth:\n"
+            "      method: password\n"
+            "      credential_ref: file:///nonexistent/secret\n"
+            "    groups: [web]\n"
+            "    tags: []\n",
+            encoding="utf-8",
+        )
+        # Long exec timeout so the blocking node-a never trips exec_timeout
+        # before the test kills the process.
+        scripts = tmp_path / "scripts.yaml"
+        scripts.write_text(
+            "scripts:\n"
+            "  - name: ok\n"
+            f"    path: {script_path.name}\n"
+            f"    sha256: {_sha_file(script_path)}\n"
+            "    risk: read_only\n"
+            "    shell: bash\n"
+            "    timeout_sec: 120\n"
+            "    enabled: true\n"
+            "    expected_exit_codes: [0]\n",
+            encoding="utf-8",
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "wft.cli.main", "run",
+             "--inventory", str(inventory), "--script", "ok",
+             "--scripts", str(scripts), "--config", str(config),
+             "--known-hosts", str(known_hosts), "--json"],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        store = Store(Database(data_dir / "wft.db"))
+        # Poll until node-b (missing password secret -> secret_resolution_failed)
+        # is committed FAILED while node-a is mid-execution (RUNNING, sleeping).
+        deadline = time.monotonic() + 30
+        run_id = None
+        uid_a_before = None
+        uid_b = None
+        while time.monotonic() < deadline:
+            with store.database.connect_migrated() as conn:
+                row = conn.execute("SELECT run_id FROM runs LIMIT 1").fetchone()
+                if row is not None:
+                    run_id = row["run_id"]
+                    tasks = {
+                        dict(r)["node_id"]: dict(r)
+                        for r in conn.execute(
+                            "SELECT node_id, status, execution_uid FROM node_tasks "
+                            "WHERE run_id=?", (run_id,)
+                        ).fetchall()
+                    }
+                    if (tasks.get("node-b", {}).get("status") == "FAILED"
+                            and tasks.get("node-a", {}).get("status") == "RUNNING"):
+                        uid_a_before = tasks["node-a"]["execution_uid"]
+                        uid_b = tasks["node-b"]["execution_uid"]
+                        break
+            time.sleep(0.1)
+        assert run_id is not None and uid_a_before and uid_b, "run never reached mid-crash state"
+        # Hard-terminate the owner process (kill -9); its run is left RUNNING.
+        proc.kill()
+        proc.wait(timeout=10)
+        assert proc.returncode == -9
+
+        # Age the heartbeat/lease past the 60s stale gate, then resume.
+        _age_run_lease(store, run_id)
+        resume = run_cli(
+            "run", "--resume", run_id,
+            "--config", str(config), "--scripts", str(scripts),
+            "--known-hosts", str(known_hosts), "--json",
+        )
+        assert resume.returncode == 1, resume.stderr
+        payload = json.loads(resume.stdout)["payload"]
+        assert payload["run_status"] == "SUCCESS"
+        assert payload["batch_status"] == "partial"
+        assert payload["counts"]["targeted"] == 2
+        assert payload["counts"]["succeeded"] == 1
+        assert payload["counts"]["failed"] == 1
+
+        run = store.get_run(run_id)
+        assert run["status"] == "SUCCESS"
+        assert run["resume_count"] == 1
+
+        with store.database.connect_migrated() as conn:
+            execs = {
+                dict(r)["node_id"]: dict(r)
+                for r in conn.execute(
+                    "SELECT node_id, execution_uid, status, attempt_count "
+                    "FROM executions WHERE run_id=?", (run_id,)
+                ).fetchall()
+            }
+            # Exactly one execution per node; node-a reuses the pre-crash uid.
+            assert set(execs) == {"node-a", "node-b"}
+            assert execs["node-a"]["execution_uid"] == uid_a_before
+            assert execs["node-a"]["status"] == "SUCCEEDED"
+            assert execs["node-b"]["execution_uid"] == uid_b  # committed node unchanged
+            assert execs["node-b"]["status"] == "FAILED"
+            attempt_seqs: dict[str, list[int]] = {}
+            for r in conn.execute(
+                "SELECT execution_uid, attempt_seq FROM attempts"
+            ).fetchall():
+                attempt_seqs.setdefault(dict(r)["execution_uid"], []).append(
+                    dict(r)["attempt_seq"]
+                )
+            events = [
+                dict(r)["event_type"]
+                for r in conn.execute(
+                    "SELECT event_type FROM run_events WHERE run_id=? "
+                    "ORDER BY occurred_at", (run_id,)
+                ).fetchall()
+            ]
+
+        # node-b was never re-run: it has exactly its single pre-crash attempt.
+        assert attempt_seqs[uid_b] == [1]
+        # The leftover node-a RUNNING attempt (seq 1, crash) plus the resumed
+        # final attempt (seq 2): attempt_count is cumulative across the crash.
+        assert attempt_seqs[uid_a_before] == [1, 2]
+        # Audit chain: created/started, first node starts, node-b finished,
+        # the resume marks node-a UNKNOWN, node-a re-runs and finishes, done.
+        for expected in ("run_created", "run_started", "node_started",
+                         "node_finished", "checkpoint_updated", "run_completed"):
+            assert expected in events
+        assert events.count("checkpoint_updated") == 2  # run-level + node-a UNKNOWN
+        assert events.count("node_finished") == 2  # node-b then node-a
+        assert events[-1] == "run_completed"
+
+
+def _age_run_lease(store: Store, run_id: str) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    with store.database.connect() as conn:
+        conn.execute(
+            "UPDATE runs SET heartbeat_at=?, lease_expires_at=? WHERE run_id=?",
+            (past, past, run_id),
+        )
+        conn.commit()
