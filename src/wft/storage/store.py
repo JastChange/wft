@@ -286,6 +286,27 @@ class Store:
                 )
         return recovered
 
+    def record_node_blocked(
+        self,
+        run_id: str,
+        node_id: str,
+        execution_uid: str,
+        *,
+        event: dict,
+        lease_owner: str | None = None,
+    ) -> None:
+        """Persist a checkpoint_updated audit for an indeterminate resumed node.
+
+        A resumed node whose persisted attempts consumed the Contract-03 cap but
+        whose last attempt has no outcome (interrupted) cannot be re-dispatched
+        and must not fabricate a Contract-03 result. This writes the audit event
+        under the lease fence and leaves the node checkpoint UNKNOWN untouched;
+        the Run stays RUNNING for human review.
+        """
+        with self.transaction() as conn:
+            self._assert_lease_owner(conn, run_id, lease_owner)
+            self._insert_event(conn, run_id, event)
+
     def release_lease(self, run_id: str, lease_owner: str) -> None:
         now = now_iso()
         with self.transaction() as conn:

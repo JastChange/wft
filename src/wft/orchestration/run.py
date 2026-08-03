@@ -119,6 +119,7 @@ class RunOutcome:
     duration_ms: int
     summary: dict
     lease_lost: bool = False
+    blocked: bool = False
 
 
 @dataclass
@@ -163,8 +164,6 @@ async def execute_run(
     # process cannot renew/resume this run's heartbeat with a shared "cli" tag.
     lease_owner = lease_owner or new_uuid7()
     limits = run_spec["payload"]["limits"]
-    loop = asyncio.get_running_loop()
-    start = loop.time()
 
     if resume:
         # Single recovery transaction: stale 3-condition CAS + new owner + the
@@ -221,6 +220,12 @@ async def execute_run(
         connect_rate_per_sec=limits["connect_rate_per_sec"],
     )
     lease_lost = asyncio.Event()
+    # A node whose persisted attempts consumed the Contract-03 cap but whose last
+    # attempt has no outcome (interrupted by the crash) is "blocked": it stays
+    # UNKNOWN and the Run stays RUNNING (exit 2) because neither a further SSH
+    # attempt nor a fabricated Contract-03 result is valid.
+    blocked = asyncio.Event()
+    blocked_nodes: list[str] = []
     node_tasks: list[asyncio.Task] = []
     task_by_id = {t["node_id"]: t for t in store.get_node_tasks(run_id)}
     # Only writable checkpoints are dispatched: PENDING (first execution) and
@@ -276,6 +281,34 @@ async def execute_run(
                 # write (checkpoint, attempt, or commit) closes the run
                 # immediately -- set the lease-lost flag, cancel siblings,
                 # return no outcome.
+                if resumed_node and _resume_disposition(store, execution_uid) == "blocked":
+                    # The last persisted attempt consumed the Contract-03 cap but
+                    # has no outcome (interrupted by the crash): no SSH attempt
+                    # may run and no Contract-03 result may be fabricated. Audit
+                    # the reason and leave the checkpoint UNKNOWN; the Run stays
+                    # RUNNING (exit 2) for human review.
+                    store.record_node_blocked(
+                        run_id,
+                        node_id,
+                        execution_uid,
+                        lease_owner=lease_owner,
+                        event=build_event(
+                            run_id,
+                            "checkpoint_updated",
+                            f"node {node_id} indeterminate: attempt cap consumed "
+                            "by an interrupted attempt with no outcome",
+                            severity="warning",
+                            node_id=node_id,
+                            execution_uid=execution_uid,
+                            data={
+                                "status": "UNKNOWN",
+                                "reason": "attempt_cap_consumed_no_outcome",
+                            },
+                        ),
+                    )
+                    blocked_nodes.append(node_id)
+                    blocked.set()
+                    return None
                 if not store.set_node_task(
                     run_id,
                     node_id,
@@ -390,7 +423,7 @@ async def execute_run(
             raise result
 
     finished_at = now_iso()
-    duration_ms = int((loop.time() - start) * 1000)
+    duration_ms = _iso_ms_delta(started_at, finished_at)
     completed = [r for r in results if isinstance(r, _NodeOutcome)]
     if resume:
         # The BatchSummary must count every original node: already-terminal
@@ -406,13 +439,24 @@ async def execute_run(
             _outcome_from_terminal(t, finished_data.get(t["node_id"], {}))
             for t in terminal
         ]
+    # A blocked node has no trustworthy outcome: it counts as UNKNOWN so the
+    # reported totals still cover every original node.
+    completed += [
+        _NodeOutcome(
+            node_id=nid, status="UNKNOWN", degraded=False,
+            secondary_errors=(), error_counts={},
+        )
+        for nid in blocked_nodes
+    ]
     counts, error_counts, degraded, any_succeeded, any_failed = _aggregate(
         nodes, completed
     )
-    if lease_lost.is_set():
-        # No authoritative final summary is possible: the DB Run stays RUNNING
-        # for the resumer, so report that contract state with exit 2 (owner
-        # loss / no final trusted result), never an invented status.
+    if lease_lost.is_set() or blocked.is_set():
+        # No authoritative final summary: either the lease was lost (a resumer
+        # took over) or a node outcome is indeterminate (blocked). The DB Run
+        # stays RUNNING -- report that contract state with exit 2 (owner loss or
+        # no final trusted result), never an invented status or a fabricated
+        # per-node result.
         return RunOutcome(
             run_id=run_id,
             run_status="RUNNING",
@@ -422,7 +466,8 @@ async def execute_run(
             exit_code=2,
             duration_ms=duration_ms,
             summary={},
-            lease_lost=True,
+            lease_lost=lease_lost.is_set(),
+            blocked=blocked.is_set(),
         )
 
     run_status, batch_status = _batch_status(degraded, any_succeeded, any_failed)
@@ -560,6 +605,46 @@ def _outcome_from_terminal(task: dict, finished_data: dict) -> _NodeOutcome:
     )
 
 
+def _iso_ms_delta(start_iso: str, end_iso: str) -> int:
+    """Return the UTC wall-clock delta between two ISO timestamps in ms."""
+    start = datetime.fromisoformat(start_iso)
+    end = datetime.fromisoformat(end_iso)
+    return max(0, int((end - start).total_seconds() * 1000))
+
+
+def _resume_disposition(store: Store, execution_uid: str) -> str:
+    """Decide how a resumed node's persisted attempts dispose.
+
+    Returns one of:
+
+    ``"proceed"``
+        A fresh attempt at ``max(attempt_seq)+1`` may run.
+    ``"reconstruct"``
+        The Contract-03 cap or the error matrix says no further SSH attempt is
+        allowed: the terminal FAILED result is rebuilt from the last completed
+        attempt's persisted error (never a 4th attempt, never a reset to 0).
+    ``"blocked"``
+        The last attempt has no outcome (interrupted before finish, or finished
+        without a persisted error) and the cap is consumed: neither SSH nor a
+        fabricated result is valid, so the node stays UNKNOWN and the Run stays
+        RUNNING (exit 2) for human review.
+    """
+    base_seq = store.get_attempt_max_seq(execution_uid)
+    if base_seq == 0:
+        return "proceed"
+    last = store.get_last_attempt(execution_uid)
+    if last["status"] != "FAILED" or last["error_class"] is None:
+        # Outcome unknown (attempt left RUNNING by a crash) or completed without
+        # a persisted error: only re-run when the cap allows a further attempt.
+        return "blocked" if base_seq >= 3 else "proceed"
+    if base_seq >= 3 or not should_retry(last["error_class"], base_seq):
+        # The error matrix's retry budget is consumed across the crash boundary:
+        # reconstruct the terminal FAILED from the last attempt, never a further
+        # SSH attempt.
+        return "reconstruct"
+    return "proceed"
+
+
 async def _execute_node(
     store: Store,
     run_id: str,
@@ -585,23 +670,29 @@ async def _execute_node(
     while each attempt keeps its own ``started_at``/``finished_at``. Every
     attempt start/end is durably persisted under the ``lease_owner`` fence;
     the attempt sequence continues from ``max(attempt_seq)+1`` so a crash never
-    resets ``attempt_count`` to 0 or duplicates an ``attempt_id``. When the
-    Contract-03 cap (3) is already consumed by persisted attempts, the terminal
-    FAILED outcome is reconstructed from the last attempt instead of running a
-    further SSH attempt. ``connect_limiter`` paces every connection attempt (a
-    retry reconnects, so each attempt waits).
+    resets ``attempt_count`` to 0 or duplicates an ``attempt_id``. The
+    ``_resume_disposition`` of a resumed node's persisted attempts decides the
+    path: a completed non-retryable or budget-exhausted attempt is
+    reconstructed to a terminal FAILED result (never a further SSH attempt),
+    while an interrupted attempt whose outcome is unknown only re-runs when the
+    cap allows. ``connect_limiter`` paces every connection attempt (a retry
+    reconnects, so each attempt waits).
     """
     node_id = node["node_id"]
     connect_timeout_sec = limits["connect_timeout_sec"]
     exec_timeout_sec = limits["exec_timeout_sec"]
     base_seq = store.get_attempt_max_seq(execution_uid)
+    if resumed and _resume_disposition(store, execution_uid) == "reconstruct":
+        # The error matrix's retry budget is already consumed across the crash
+        # boundary: rebuild the terminal FAILED result from the last completed
+        # attempt instead of running a further SSH attempt.
+        return _synthesize_exhausted(store, run_id, node, script, execution_uid)
     attempts: list[dict] = []
     local_attempts = 0
-    loop = asyncio.get_running_loop()
-    logical_start_loop = loop.time()
     if base_seq > 0:
         # A resumed execution spans the original first attempt start, not the
-        # resume time: Contract-03 ``started_at`` covers the whole logical run.
+        # resume time: Contract-03 ``started_at``/``duration_ms`` cover the whole
+        # logical run across the crash boundary.
         logical_started_at = store.get_first_attempt_started(execution_uid) or now_iso()
     else:
         logical_started_at = now_iso()
@@ -609,11 +700,13 @@ async def _execute_node(
     while True:
         seq = base_seq + local_attempts + 1
         if seq > 3:
-            # Contract-03 caps attempt_count at 3 for the whole logical
-            # execution: the retry budget is exhausted across the crash
-            # boundary, so reconstruct the terminal FAILED outcome from the
-            # last persisted attempt instead of running a 4th SSH attempt.
-            return _synthesize_exhausted(store, run_id, node, script, execution_uid)
+            # Unreachable when disposition is "proceed": ``should_retry`` caps
+            # the increments and the exhausted case is handled by "reconstruct"
+            # above. Guard against a 4th SSH attempt if the invariants ever break.
+            raise WFTError(
+                f"node {node_id}: attempt_seq {seq} exceeds the Contract-03 cap; "
+                "refusing to run a further SSH attempt"
+            )
         if connect_limiter is not None:
             await connect_limiter.wait()
         local_attempts += 1
@@ -664,7 +757,10 @@ async def _execute_node(
         extra_flags: list[str] = []
         if resumed:
             extra_flags.append("resumed")
-        if local_attempts > 1:
+        if seq > 1:
+            # ``retried`` reflects the cumulative attempt_count across the whole
+            # logical execution (a resumed node's persisted attempts included),
+            # not just the attempts run by this process.
             extra_flags.append("retried")
         result, degraded, secondary_errors = build_execution_result(
             run_id=run_id,
@@ -675,7 +771,7 @@ async def _execute_node(
             attempt_count=seq,
             started_at=logical_started_at,
             finished_at=logical_finished_at,
-            duration_ms=int((loop.time() - logical_start_loop) * 1000),
+            duration_ms=_iso_ms_delta(logical_started_at, logical_finished_at),
             exit_code=outcome.exit_code,
             stdout_bytes=outcome.stdout,
             stderr_bytes=outcome.stderr,
@@ -712,8 +808,12 @@ def _synthesize_exhausted(
         "message": last["error_message"],
         "retryable": bool(last["retryable"]),
     }
-    started_at = last["started_at"]
+    # The reconstructed result spans the whole logical execution: from the first
+    # persisted attempt's start (not the resume time) to the last attempt's
+    # finish, so ``duration_ms`` stays truthful across the crash boundary.
+    started_at = store.get_first_attempt_started(execution_uid) or last["started_at"]
     finished_at = last["finished_at"] or started_at
+    extra_flags = ("resumed", "retried") if last["attempt_seq"] > 1 else ("resumed",)
     result, _, secondary = build_execution_result(
         run_id=run_id,
         execution_uid=execution_uid,
@@ -723,13 +823,13 @@ def _synthesize_exhausted(
         attempt_count=last["attempt_seq"],
         started_at=started_at,
         finished_at=finished_at,
-        duration_ms=0,
+        duration_ms=_iso_ms_delta(started_at, finished_at),
         exit_code=None,
         stdout_bytes=b"",
         stderr_bytes=b"",
         error=error,
         blobs=store.blobs,
-        extra_flags=("resumed",),
+        extra_flags=extra_flags,
     )
     degraded = last["error_class"] in _DEGRADING_CLASSES
     return result, degraded, secondary, []

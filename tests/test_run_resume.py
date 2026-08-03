@@ -8,6 +8,13 @@ Contract-03 ``attempt_count`` is cumulative across the crash boundary (never a
 reset to zero, never a duplicated attempt_id, never a 4th SSH attempt when the
 cap of 3 is consumed), and finalizes a BatchSummary that counts every original
 node (committed terminal + newly dispatched).
+
+The ``_resume_disposition`` of a resumed node's persisted attempts decides the
+path: a completed non-retryable/budget-exhausted attempt reconstructs a
+terminal FAILED result (no further SSH); an interrupted attempt whose outcome
+is unknown only re-runs when the cap allows; an interrupted seq-3 attempt with
+no outcome stays UNKNOWN and leaves the Run RUNNING (exit 2) with the reason
+audited -- never a fabricated Contract-03 result.
 """
 from __future__ import annotations
 
@@ -287,7 +294,7 @@ def test_resume_reuses_uid_and_continues_attempts_from_max_plus_one(
     assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
                                lease_owner="owner-1")
     _record_attempts(store, run_id, "node-a", uid,
-                     finals=[(1, "exec_nonzero"), (2, "exec_nonzero")])
+                     finals=[(1, "conn_timeout"), (2, "conn_timeout")])
     _make_stale(store, run_id)
 
     calls: list[int] = []
@@ -341,7 +348,7 @@ def test_resume_attempt_cap_forbids_fourth_ssh_attempt(tmp_path: Path, monkeypat
     assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
                                lease_owner="owner-1")
     _record_attempts(store, run_id, "node-a", uid,
-                     finals=[(1, "exec_nonzero"), (2, "exec_nonzero"), (3, "exec_nonzero")])
+                     finals=[(1, "conn_timeout"), (2, "conn_timeout"), (3, "conn_timeout")])
     _make_stale(store, run_id)
 
     calls: list[int] = []
@@ -369,11 +376,175 @@ def test_resume_attempt_cap_forbids_fourth_ssh_attempt(tmp_path: Path, monkeypat
         assert row["attempt_count"] == 3  # the cumulative cap, never 4
         assert row["status"] == "FAILED"
         error = json.loads(row["error_json"])
-        assert error["class"] == "exec_nonzero"  # last persisted attempt's error
+        assert error["class"] == "conn_timeout"  # last persisted attempt's error
         assert (
             conn.execute("SELECT COUNT(*) FROM attempts WHERE execution_uid=?",
                          (uid,)).fetchone()[0] == 3
         )
+
+
+def test_resume_non_retryable_attempt_reconstructs_failed_no_ssh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A completed PERMANENT failure consumes its single attempt: resume
+    reconstructs FAILED without a second SSH attempt (error matrix respected)."""
+    script = _script(_scratch(tmp_path))
+    nodes = [_node("node-a", tmp_path / "key")]
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id = _start_owned_run(store, spec, ["node-a"])
+    uid = new_uuid7()
+    assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
+                               lease_owner="owner-1")
+    _record_attempts(store, run_id, "node-a", uid, finals=[(1, "exec_nonzero")])
+    _make_stale(store, run_id)
+
+    calls: list[int] = []
+
+    async def _never(**kwargs):  # must never be reached
+        calls.append(1)
+        return ExecutionOutcome(exit_code=0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(run_mod, "execute_script", _never)
+    outcome = asyncio.run(
+        execute_run(
+            store, run_id=run_id, run_spec=spec, nodes=nodes, script=script,
+            known_hosts_path=None, resume=True,
+        )
+    )
+    assert calls == []  # PERMANENT failure: no 2nd SSH attempt
+    assert outcome.counts["failed"] == 1
+    assert outcome.exit_code == 1
+    with store.database.connect_migrated() as conn:
+        row = conn.execute(
+            "SELECT status, attempt_count, error_json FROM executions WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        assert row["status"] == "FAILED"
+        assert row["attempt_count"] == 1
+        assert json.loads(row["error_json"])["class"] == "exec_nonzero"
+
+
+def test_resume_seq3_interrupted_node_stays_unknown_run_running_exit2(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A seq-3 attempt left RUNNING by a crash is indeterminate: no 4th SSH, no
+    fabricated Contract-03 result -- the node stays UNKNOWN, the Run stays
+    RUNNING, exit 2, and the reason is audited."""
+    script = _script(_scratch(tmp_path))
+    nodes = [_node("node-a", tmp_path / "key")]
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id = _start_owned_run(store, spec, ["node-a"])
+    uid = new_uuid7()
+    assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
+                               lease_owner="owner-1")
+    _record_attempts(store, run_id, "node-a", uid,
+                     finals=[(1, "conn_timeout"), (2, "conn_timeout")])
+    # The 3rd attempt started but never finished (outcome unknown, no error).
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=new_uuid7(), attempt_seq=3, status="RUNNING",
+        started_at=now_iso(), lease_owner="owner-1",
+    )
+    _make_stale(store, run_id)
+
+    calls: list[int] = []
+
+    async def _never(**kwargs):  # must never be reached
+        calls.append(1)
+        return ExecutionOutcome(exit_code=0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(run_mod, "execute_script", _never)
+    outcome = asyncio.run(
+        execute_run(
+            store, run_id=run_id, run_spec=spec, nodes=nodes, script=script,
+            known_hosts_path=None, resume=True,
+        )
+    )
+    assert calls == []  # no 4th SSH attempt
+    assert outcome.exit_code == 2
+    assert outcome.run_status == "RUNNING"
+    assert outcome.batch_status is None
+    assert outcome.summary == {}
+    assert outcome.counts == {"targeted": 1, "succeeded": 0, "failed": 0,
+                              "unknown": 1, "cancelled": 0, "skipped": 0}
+    assert store.get_node_task(run_id, "node-a")["status"] == "UNKNOWN"
+    assert store.get_run(run_id)["status"] == "RUNNING"
+    with store.database.connect_migrated() as conn:
+        # No Contract-03 result may be fabricated for an indeterminate attempt.
+        assert (
+            conn.execute("SELECT COUNT(*) FROM executions WHERE run_id=?",
+                         (run_id,)).fetchone()[0] == 0
+        )
+        events = [
+            dict(r) for r in conn.execute(
+                "SELECT event_type, node_id, data_json FROM run_events "
+                "WHERE run_id=? ORDER BY occurred_at", (run_id,)
+            ).fetchall()
+        ]
+        audits = [
+            e for e in events
+            if e["event_type"] == "checkpoint_updated" and e["node_id"] == "node-a"
+        ]
+        assert len(audits) >= 1
+        assert any(
+            json.loads(e["data_json"]).get("reason")
+            == "attempt_cap_consumed_no_outcome"
+            for e in audits
+        )
+
+
+def test_resume_duration_and_retried_flag_across_crash_boundary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Resumed duration_ms spans the original first attempt (frozen 90s), and
+    ``retried`` reflects the cumulative attempt_count, not this process's."""
+    script = _script(_scratch(tmp_path))
+    nodes = [_node("node-a", tmp_path / "key")]
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id = _start_owned_run(store, spec, ["node-a"])
+    uid = new_uuid7()
+    assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
+                               lease_owner="owner-1")
+    # The first attempt failed retryably at T0; the resume re-runs 90s later.
+    t90 = now_iso()
+    t0 = (datetime.fromisoformat(t90) - timedelta(seconds=90)).isoformat()
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=new_uuid7(), attempt_seq=1, status="FAILED",
+        started_at=t0, finished_at=t0,
+        error=error_dict("conn_timeout", "attempt 1 timed out"),
+        lease_owner="owner-1",
+    )
+    _make_stale(store, run_id)
+
+    # Freeze the clock: the resumed attempt runs at T0+90s, not wall-clock-now.
+    monkeypatch.setattr(run_mod, "now_iso", lambda: t90)
+
+    async def _ok(**kwargs):
+        return ExecutionOutcome(exit_code=0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(run_mod, "execute_script", _ok)
+    outcome = asyncio.run(
+        execute_run(
+            store, run_id=run_id, run_spec=spec, nodes=nodes, script=script,
+            known_hosts_path=None, resume=True,
+        )
+    )
+    assert outcome.counts["succeeded"] == 1
+    with store.database.connect_migrated() as conn:
+        row = conn.execute(
+            "SELECT result_json FROM executions WHERE run_id=?", (run_id,)
+        ).fetchone()
+        result = json.loads(row["result_json"])["payload"]
+        assert result["status"] == "SUCCEEDED"
+        assert result["attempt_count"] == 2
+        assert result["started_at"] == t0  # spans the original first attempt
+        assert abs(result["duration_ms"] - 90000) <= 5  # ~90s, not ~0s loop time
+        assert "resumed" in result["flags"]
+        assert "retried" in result["flags"]  # cumulative attempt_count > 1
 
 
 def test_resume_zero_dispatch_finalizes_all_terminal(tmp_path: Path, monkeypatch) -> None:
