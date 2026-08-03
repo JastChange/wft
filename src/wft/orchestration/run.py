@@ -81,18 +81,18 @@ def create_run(store: Store, run_spec: dict, node_ids: list[str]) -> tuple[str, 
     nothing is re-inserted for it (AC-011).
     """
     validate_contract("contract-02-runspec", run_spec)
-    run_id, created = store.create_run(run_spec["payload"])
+    payload = run_spec["payload"]
+    run_id, created = store.create_run(
+        payload,
+        audit_event=build_event(
+            payload["run_id"],
+            "run_created",
+            "run created",
+            data={"targeted": len(node_ids)},
+        ),
+    )
     if created:
         store.insert_node_tasks(run_id, node_ids)
-        store.insert_run_event(
-            run_id,
-            build_event(
-                run_id,
-                "run_created",
-                "run created",
-                data={"targeted": len(node_ids)},
-            ),
-        )
     return run_id, created
 
 
@@ -127,20 +127,20 @@ async def execute_run(
     loop = asyncio.get_running_loop()
     start = loop.time()
 
-    if not store.start_run(run_id, lease_owner=lease_owner):
-        raise WFTError(
-            f"run {run_id}: could not start (expected QUEUED; "
-            "a RUNNING lease must go through resume, not a plain overwrite)"
-        )
-    store.insert_run_event(
+    if not store.start_run(
         run_id,
-        build_event(
+        lease_owner=lease_owner,
+        audit_event=build_event(
             run_id,
             "run_started",
             "run started",
             data={"targeted": len(nodes)},
         ),
-    )
+    ):
+        raise WFTError(
+            f"run {run_id}: could not start (expected QUEUED; "
+            "a RUNNING lease must go through resume, not a plain overwrite)"
+        )
 
     counts = {
         "targeted": len(nodes),

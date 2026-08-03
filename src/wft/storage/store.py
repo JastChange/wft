@@ -70,13 +70,18 @@ class Store:
 
     # --------------------------------------------------------------- runs
 
-    def create_run(self, run_spec: dict) -> tuple[str, bool]:
+    def create_run(
+        self, run_spec: dict, *, audit_event: dict | None = None
+    ) -> tuple[str, bool]:
         """Persist a validated Contract-02 payload; enforce idempotency.
 
         Returns ``(run_id, created)``. ``created=False`` means an identical
         Run (same idempotency_key and same parameters) already exists and is
-        returned. Same key with different parameters raises
-        :class:`WFTIdempotencyConflict`.
+        returned (no audit event is written for a reuse). Same key with
+        different parameters raises :class:`WFTIdempotencyConflict`. When a new
+        Run is created, ``audit_event`` (a Contract-09 envelope) is written in
+        the same transaction as the Run row, so the run_created audit can never
+        land without its business state or vice versa.
         """
         run_id = run_spec["run_id"]
         trigger = run_spec.get("trigger") or {}
@@ -104,6 +109,8 @@ class Store:
                 "VALUES (?, ?, 'QUEUED', NULL, ?, NULL, NULL, ?, ?, ?, NULL, NULL)",
                 (run_id, spec_json, now, idem, now, now),
             )
+            if audit_event is not None:
+                self._insert_event(conn, run_id, audit_event)
             return run_id, True
 
     def get_run(self, run_id: str) -> dict | None:
@@ -148,12 +155,17 @@ class Store:
 
     # ------------------------------------------------------ run lifecycle
 
-    def start_run(self, run_id: str, *, lease_owner: str) -> bool:
+    def start_run(
+        self, run_id: str, *, lease_owner: str, audit_event: dict | None = None
+    ) -> bool:
         """Transition QUEUED -> RUNNING, taking the recovery lease atomically.
 
         Only a QUEUED run may be started. A live RUNNING run owned by another
         worker must go through ``acquire_resume_lock`` (heartbeat + lease CAS),
         never a plain overwrite; False means the transition did not apply.
+        When the transition applies, ``audit_event`` (a Contract-09 envelope) is
+        written in the same transaction as the status update, so the run_started
+        audit can never land without the state change or vice versa.
         """
         now = now_iso()
         lease_expires = _add_seconds(now, LEASE_SECONDS)
@@ -165,6 +177,8 @@ class Store:
                 "WHERE run_id=? AND status='QUEUED'",
                 (now, lease_owner, lease_expires, now, now, run_id),
             )
+            if cur.rowcount == 1 and audit_event is not None:
+                self._insert_event(conn, run_id, audit_event)
             return cur.rowcount == 1
 
     def renew_lease(self, run_id: str, lease_owner: str) -> bool:
@@ -179,12 +193,17 @@ class Store:
             )
             return cur.rowcount == 1
 
-    def acquire_resume_lock(self, run_id: str, lease_owner: str) -> bool:
+    def acquire_resume_lock(
+        self, run_id: str, *, lease_owner: str, audit_event: dict | None = None
+    ) -> bool:
         """Single-CAS resume: Run=RUNNING, heartbeat stale, lease expired.
 
         The heartbeat is renewed every ``HEARTBEAT_SECONDS`` but the stale gate
         is the full ``LEASE_SECONDS``: a worker only reclaims a Run whose lease
         has actually lapsed, never one that is merely slow to heartbeat.
+        When the reclaim applies, ``audit_event`` (a Contract-09 envelope) is
+        written in the same transaction as the lease/checkpoint update, so a
+        resume can never be audited without its state change or vice versa.
         """
         now = now_iso()
         stale_before = _add_seconds(now, -LEASE_SECONDS)
@@ -198,6 +217,8 @@ class Store:
                 "AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
                 (now, lease_owner, lease_expires, now, run_id, stale_before, now),
             )
+            if cur.rowcount == 1 and audit_event is not None:
+                self._insert_event(conn, run_id, audit_event)
             return cur.rowcount == 1
 
     def release_lease(self, run_id: str, lease_owner: str) -> None:

@@ -19,6 +19,7 @@ from wft.storage.schema import SCHEMA_VERSION, migrate
 from wft.storage.store import Store
 
 import wft.storage.schema as schema
+from wft.orchestration.events import build_event
 
 
 @pytest.fixture()
@@ -273,6 +274,110 @@ def test_acquire_resume_lock_stale_gate_is_lease_seconds(store: Store) -> None:
     _age(90)
     assert store.acquire_resume_lock(rid, lease_owner="worker-2") is True
     assert store.get_run(rid)["lease_owner"] == "worker-2"
+
+
+# ----------------------------------------------------- audit (same transaction)
+
+
+def _event_types(store: Store, run_id: str) -> list[str]:
+    with store.database.connect() as conn:
+        rows = conn.execute(
+            "SELECT event_type FROM run_events WHERE run_id=? ORDER BY occurred_at",
+            (run_id,),
+        ).fetchall()
+        return [dict(r)["event_type"] for r in rows]
+
+
+def test_create_run_audit_persisted_in_same_tx(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid), audit_event=build_event(rid, "run_created", "run created"))
+    assert _event_types(store, rid) == ["run_created"]
+
+
+def test_start_run_audit_persisted_in_same_tx(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    assert store.start_run(
+        rid, lease_owner="worker-1",
+        audit_event=build_event(rid, "run_started", "run started"),
+    ) is True
+    assert _event_types(store, rid) == ["run_started"]
+
+
+def test_resume_audit_persisted_in_same_tx(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.start_run(rid, lease_owner="worker-1")
+    past = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    conn = store.database.connect()
+    conn.execute(
+        "UPDATE runs SET heartbeat_at=?, lease_expires_at=? WHERE run_id=?",
+        (past, past, rid),
+    )
+    conn.commit()
+    conn.close()
+    assert store.acquire_resume_lock(
+        rid, lease_owner="worker-2",
+        audit_event=build_event(rid, "checkpoint_updated", "run resumed by worker-2"),
+    ) is True
+    assert _event_types(store, rid) == ["checkpoint_updated"]
+
+
+def test_start_run_audit_failure_rolls_back_state(tmp_path: Path, monkeypatch) -> None:
+    """Fault injection: an audit-event write failing rolls back the status
+    update, so a run can never be RUNNING without its audit (or vice versa)."""
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+
+    def _boom(conn, run_id, event):
+        raise WFTStorageError("event write failed")
+
+    monkeypatch.setattr(store, "_insert_event", _boom)
+    with pytest.raises(WFTStorageError, match="event write failed"):
+        store.start_run(
+            rid, lease_owner="worker-1",
+            audit_event=build_event(rid, "run_started", "run started"),
+        )
+    # The QUEUED->RUNNING update was rolled back with the event write.
+    assert store.get_run(rid)["status"] == "QUEUED"
+    assert _event_types(store, rid) == []
+
+
+def test_create_run_audit_failure_rolls_back_run(tmp_path: Path, monkeypatch) -> None:
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+
+    def _boom(conn, run_id, event):
+        raise WFTStorageError("event write failed")
+
+    monkeypatch.setattr(store, "_insert_event", _boom)
+    with pytest.raises(WFTStorageError, match="event write failed"):
+        store.create_run(
+            _run_spec("01HX0" + "A" * 21),
+            audit_event=build_event("01HX0" + "A" * 21, "run_created", "run created"),
+        )
+    with store.database.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0
+
+
+def test_start_run_state_failure_writes_no_audit(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    # First transition applies and audits.
+    assert store.start_run(
+        rid, lease_owner="worker-1",
+        audit_event=build_event(rid, "run_started", "run started"),
+    ) is True
+    # The second cannot apply (RUNNING, not QUEUED) and must not audit.
+    assert store.start_run(
+        rid, lease_owner="worker-2",
+        audit_event=build_event(rid, "run_started", "run started"),
+    ) is False
+    assert _event_types(store, rid) == ["run_started"]
 
 
 # ------------------------------------------------------- node result commit
