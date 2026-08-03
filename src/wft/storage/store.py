@@ -397,51 +397,41 @@ class Store:
     ) -> None:
         """Durably persist one SSH attempt (start or final) under the lease fence.
 
-        Each attempt is written as it happens: ``status='RUNNING'`` with
-        ``finished_at=NULL`` before the SSH call, then updated to its final
-        status/error/``finished_at`` after it. A kill -9 therefore leaves a
-        durable per-attempt record and a resume continues from
-        ``max(attempt_seq)+1``. The upsert keys on ``(execution_uid,
-        attempt_id)`` so start and final writes share one row and no attempt_id
-        is ever duplicated. ``lease_owner`` fences the write: an owner who lost
-        the lease (a resumer took it) raises :class:`WFTLeaseLostError` instead
-        of corrupting the resumer's attempt sequence.
+        START (``status='RUNNING'``) inserts a fresh attempt row with
+        ``finished_at=NULL`` before the SSH call; the subsequent END updates the
+        SAME row to its final status/error/``finished_at``. A kill -9 therefore
+        leaves a durable per-attempt record and a resume continues from
+        ``max(attempt_seq)+1``. ``lease_owner`` fences the write: an owner who
+        lost the lease (a resumer took it) raises :class:`WFTLeaseLostError`
+        instead of corrupting the resumer's attempt sequence.
 
-        In the SAME fenced transaction the node checkpoint's ``attempt_count``
-        is CAS-updated to mirror this attempt: a START write bumps it
-        monotonically (``attempt_count < seq``, raising
-        :class:`WFTLeaseLostError` when the checkpoint is not RUNNING with this
-        ``execution_uid``). An END write applies the same strong CAS (matching
-        run/node/RUNNING/execution_uid) and sets
-        ``attempt_count=MAX(attempt_count, seq)`` so it never decreases; a
-        checkpoint that is not hit raises :class:`WFTLeaseLostError`, which
-        rolls the attempt upsert back too -- a final attempt can never land
-        without its checkpoint CAS. So the checkpoint count is always the
-        highest persisted attempt_seq -- a resumed node's cumulative count --
-        and never a per-process reset.
+        START and END are strict: an END never INSERTs (a never-STARTed attempt
+        must not materialize) and only finalizes an existing RUNNING row with
+        matching ``execution_uid``/``attempt_id``/``attempt_seq``/``started_at``;
+        anything else raises :class:`WFTLeaseLostError` and rolls the whole
+        transaction back. In the SAME fenced transaction the node checkpoint's
+        ``attempt_count`` is CAS-updated to mirror this attempt: a START write
+        bumps it monotonically (``attempt_count < seq``, raising when the
+        checkpoint is not RUNNING with this ``execution_uid``); an END applies
+        the same strong CAS and sets ``attempt_count=MAX(attempt_count, seq)``
+        so a lower-seq final write never decreases the count. The checkpoint
+        count is always the highest persisted attempt_seq -- a resumed node's
+        cumulative count -- and never a per-process reset.
         """
         now = now_iso()
         with self.transaction() as conn:
             self._assert_lease_owner(conn, run_id, lease_owner)
-            conn.execute(
-                "INSERT INTO attempts (execution_uid, attempt_id, attempt_seq, status, "
-                "error_class, error_category, error_message, retryable, started_at, "
-                "finished_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(execution_uid, attempt_id) DO UPDATE SET "
-                "status=excluded.status, error_class=excluded.error_class, "
-                "error_category=excluded.error_category, "
-                "error_message=excluded.error_message, retryable=excluded.retryable, "
-                "finished_at=excluded.finished_at",
-                (
-                    execution_uid, attempt_id, attempt_seq, status,
-                    (error or {}).get("class"), (error or {}).get("category"),
-                    (error or {}).get("message"),
-                    int(bool((error or {}).get("retryable"))),
-                    started_at, finished_at,
-                ),
-            )
             if status == "RUNNING":
+                # START: persist the attempt as RUNNING, then bump the
+                # checkpoint. attempt_id is always fresh (new_uuid7), so an
+                # accidental duplicate INSERT fails loudly and rolls back.
+                conn.execute(
+                    "INSERT INTO attempts (execution_uid, attempt_id, attempt_seq, "
+                    "status, error_class, error_category, error_message, retryable, "
+                    "started_at, finished_at) "
+                    "VALUES (?, ?, ?, 'RUNNING', NULL, NULL, NULL, 0, ?, NULL)",
+                    (execution_uid, attempt_id, attempt_seq, started_at),
+                )
                 cur = conn.execute(
                     "UPDATE node_tasks SET attempt_count=?, updated_at=? "
                     "WHERE run_id=? AND node_id=? AND status='RUNNING' "
@@ -455,10 +445,29 @@ class Store:
                         f"attempt {attempt_seq}"
                     )
             else:
-                # Strong END CAS: match run/node/RUNNING/execution_uid and never
-                # lower the count. A miss means the final attempt cannot be tied
-                # to its checkpoint -- raise so the attempt upsert above rolls
-                # back and the row stays RUNNING.
+                # END: finalize the exact attempt that STARTed -- an existing
+                # RUNNING row with matching execution_uid/attempt_id/attempt_seq/
+                # started_at. Never INSERT (a never-STARTed attempt must not
+                # materialize); a miss raises so the whole transaction rolls
+                # back and the checkpoint is untouched.
+                cur = conn.execute(
+                    "UPDATE attempts SET status=?, error_class=?, error_category=?, "
+                    "error_message=?, retryable=?, finished_at=? "
+                    "WHERE execution_uid=? AND attempt_id=? AND attempt_seq=? "
+                    "AND status='RUNNING' AND started_at=?",
+                    (
+                        status, (error or {}).get("class"),
+                        (error or {}).get("category"), (error or {}).get("message"),
+                        int(bool((error or {}).get("retryable"))),
+                        finished_at, execution_uid, attempt_id, attempt_seq, started_at,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise WFTLeaseLostError(
+                        f"run {run_id}: node {node_id} has no RUNNING attempt "
+                        f"{attempt_id} (seq {attempt_seq}) with execution_uid "
+                        f"{execution_uid} to finalize"
+                    )
                 cur = conn.execute(
                     "UPDATE node_tasks SET attempt_count=MAX(attempt_count, ?), "
                     "updated_at=? "

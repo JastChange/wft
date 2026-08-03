@@ -177,17 +177,24 @@ def _commit_terminal(
 def _record_attempts(
     store: Store, run_id: str, node_id: str, uid: str, *, finals: list[tuple[int, str]]
 ) -> None:
-    """Durably persist final attempt rows for a crashed first execution."""
+    """Durably persist final attempt rows for a crashed first execution.
+
+    Each attempt is recorded the way the orchestration flow would: START first,
+    then END with the same attempt_id/started_at -- an END without a START row
+    is rejected by the storage layer.
+    """
     for seq, error_class in finals:
+        attempt_id = new_uuid7()
+        started = now_iso()
         store.record_attempt(
-            run_id,
-            node_id,
-            uid,
-            attempt_id=new_uuid7(),
-            attempt_seq=seq,
-            status="FAILED",
-            started_at=now_iso(),
-            finished_at=now_iso(),
+            run_id, node_id, uid,
+            attempt_id=attempt_id, attempt_seq=seq, status="RUNNING",
+            started_at=started, lease_owner="owner-1",
+        )
+        store.record_attempt(
+            run_id, node_id, uid,
+            attempt_id=attempt_id, attempt_seq=seq, status="FAILED",
+            started_at=started, finished_at=now_iso(),
             error=error_dict(error_class, f"attempt {seq} failed"),
             lease_owner="owner-1",
         )
@@ -512,9 +519,15 @@ def test_resume_duration_and_retried_flag_across_crash_boundary(
     # The first attempt failed retryably at T0; the resume re-runs 90s later.
     t90 = now_iso()
     t0 = (datetime.fromisoformat(t90) - timedelta(seconds=90)).isoformat()
+    attempt_1_id = new_uuid7()
     store.record_attempt(
         run_id, "node-a", uid,
-        attempt_id=new_uuid7(), attempt_seq=1, status="FAILED",
+        attempt_id=attempt_1_id, attempt_seq=1, status="RUNNING",
+        started_at=t0, lease_owner="owner-1",
+    )
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=attempt_1_id, attempt_seq=1, status="FAILED",
         started_at=t0, finished_at=t0,
         error=error_dict("conn_timeout", "attempt 1 timed out"),
         lease_owner="owner-1",
@@ -647,12 +660,12 @@ def test_record_attempt_end_rejected_when_checkpoint_not_owned(
     assert store.get_node_task(run_id, "node-OTHER") is None
 
 
-def test_record_attempt_end_lower_seq_never_decreases_checkpoint(
+def test_record_attempt_end_without_start_rejected_no_side_effects(
     tmp_path: Path,
 ) -> None:
-    """An out-of-order END with a smaller attempt_seq must not lower the
-    checkpoint count: ``attempt_count=MAX(attempt_count, seq)`` keeps it at the
-    highest persisted attempt."""
+    """An END may only finalize an attempt that STARTed: a never-STARTed END
+    (and an END whose seq/attempt_id does not match the RUNNING row) raises and
+    leaves the checkpoint and the attempts table untouched."""
     script = _script(_scratch(tmp_path))
     store = _make_store(tmp_path)
     spec = _make_run_spec(script)
@@ -661,17 +674,96 @@ def test_record_attempt_end_lower_seq_never_decreases_checkpoint(
     assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
                                lease_owner="owner-1")
 
-    _record_attempts(store, run_id, "node-a", uid,
-                     finals=[(1, "conn_timeout"), (2, "conn_timeout"),
-                             (3, "conn_timeout")])
-    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 3
+    error = error_dict("conn_timeout", "never started")
+    with pytest.raises(WFTLeaseLostError):
+        store.record_attempt(
+            run_id, "node-a", uid,
+            attempt_id=new_uuid7(), attempt_seq=2, status="FAILED",
+            started_at=now_iso(), finished_at=now_iso(),
+            error=error, lease_owner="owner-1",
+        )
+    # No side effects: no attempt row materialized and the count is untouched.
+    assert store.get_attempt_max_seq(uid) == 0
+    assert store.get_last_attempt(uid) is None
+    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 0
 
-    # A replayed/out-of-order final write for seq 2 keeps the count at 3.
+    # A real START, then an END with the wrong seq or a different (never-started)
+    # attempt_id -- both rejected, the STARTed row stays RUNNING.
+    attempt_id = new_uuid7()
+    started = now_iso()
     store.record_attempt(
         run_id, "node-a", uid,
-        attempt_id=new_uuid7(), attempt_seq=2, status="FAILED",
-        started_at=now_iso(), finished_at=now_iso(),
-        error=error_dict("conn_timeout", "replayed attempt 2"),
+        attempt_id=attempt_id, attempt_seq=1, status="RUNNING",
+        started_at=started, lease_owner="owner-1",
+    )
+    with pytest.raises(WFTLeaseLostError):
+        store.record_attempt(
+            run_id, "node-a", uid,
+            attempt_id=attempt_id, attempt_seq=2,  # wrong seq for this attempt_id
+            status="FAILED", started_at=started, finished_at=now_iso(),
+            error=error, lease_owner="owner-1",
+        )
+    with pytest.raises(WFTLeaseLostError):
+        store.record_attempt(
+            run_id, "node-a", uid,
+            attempt_id=new_uuid7(), attempt_seq=1,  # different attempt_id
+            status="FAILED", started_at=started, finished_at=now_iso(),
+            error=error, lease_owner="owner-1",
+        )
+    last = store.get_last_attempt(uid)
+    assert last is not None and last["status"] == "RUNNING"
+    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 1
+
+
+def test_record_attempt_end_lower_seq_never_decreases_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """An out-of-order END with a smaller attempt_seq must not lower the
+    checkpoint count: ``attempt_count=MAX(attempt_count, seq)`` keeps it at the
+    highest persisted attempt. The END finalizes the REAL seq-2 attempt (its own
+    attempt_id), not a fabricated duplicate seq."""
+    script = _script(_scratch(tmp_path))
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id = _start_owned_run(store, spec, ["node-a"])
+    uid = new_uuid7()
+    assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
+                               lease_owner="owner-1")
+
+    def _start(seq: int) -> tuple[str, str]:
+        attempt_id = new_uuid7()
+        started = now_iso()
+        store.record_attempt(
+            run_id, "node-a", uid,
+            attempt_id=attempt_id, attempt_seq=seq, status="RUNNING",
+            started_at=started, lease_owner="owner-1",
+        )
+        return attempt_id, started
+
+    a1, s1 = _start(1)
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=a1, attempt_seq=1, status="FAILED",
+        started_at=s1, finished_at=now_iso(),
+        error=error_dict("conn_timeout", "attempt 1 failed"),
+        lease_owner="owner-1",
+    )
+    a2, s2 = _start(2)  # still RUNNING
+    _start(3)           # out-of-order: seq 3 starts before seq 2 finalizes
+    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 3
+
+    # Finalize the real seq-2 attempt: MAX(3, 2) keeps the count at 3.
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=a2, attempt_seq=2, status="FAILED",
+        started_at=s2, finished_at=now_iso(),
+        error=error_dict("conn_timeout", "attempt 2 failed"),
         lease_owner="owner-1",
     )
     assert store.get_node_task(run_id, "node-a")["attempt_count"] == 3
+    with store.database.connect_migrated() as conn:
+        row = conn.execute(
+            "SELECT status FROM attempts WHERE execution_uid=? AND attempt_id=?",
+            (uid, a2),
+        ).fetchone()
+        assert row is not None and row["status"] == "FAILED"
