@@ -263,15 +263,22 @@ class Store:
         Terminal statuses may never be rewritten and RUNNING may only follow a
         non-terminal state, so a finished node cannot be silently re-flagged.
         When ``lease_owner`` is given, the checkpoint is fenced: the update only
-        applies while the run's current lease owner matches, so an owner who
-        lost the lease (to a resumer) can never advance a node checkpoint.
-        When the transition applies, ``event`` (a Contract-09 envelope) is
-        written in the same transaction as the checkpoint update, so a node
-        state change and its audit can never land on only one side.
+        applies while the run is RUNNING, its current lease owner matches and
+        the lease is unexpired. A checkpoint attempted by an owner who lost the
+        lease (to a resumer, or after expiry) raises :class:`WFTLeaseLostError`
+        so the stale owner can never advance a node checkpoint. When the
+        transition applies, ``event`` (a Contract-09 envelope) is written in
+        the same transaction as the checkpoint update, so a node state change
+        and its audit can never land on only one side.
         """
         now = now_iso()
-        fence = " AND EXISTS (SELECT 1 FROM runs WHERE run_id=? AND lease_owner=?)"
+        fence = (
+            " AND EXISTS (SELECT 1 FROM runs WHERE run_id=? AND status='RUNNING' "
+            "AND lease_owner=? AND lease_expires_at > ?)"
+        )
         with self.transaction() as conn:
+            if lease_owner is not None:
+                self._assert_lease_owner(conn, run_id, lease_owner)
             if status in ("RUNNING",):
                 cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, "
@@ -279,7 +286,7 @@ class Store:
                     "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')"
                     + (fence if lease_owner is not None else ""),
                     (status, execution_uid, now, now, run_id, node_id)
-                    + (() if lease_owner is None else (run_id, lease_owner)),
+                    + (() if lease_owner is None else (run_id, lease_owner, now)),
                 )
             else:
                 # A terminal status may only be set from a writable
@@ -291,7 +298,7 @@ class Store:
                     "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')"
                     + (fence if lease_owner is not None else ""),
                     (status, execution_uid, error_class, now, now, run_id, node_id)
-                    + (() if lease_owner is None else (run_id, lease_owner)),
+                    + (() if lease_owner is None else (run_id, lease_owner, now)),
                 )
             if cur.rowcount == 1 and event is not None:
                 self._insert_event(conn, run_id, event)
@@ -498,21 +505,36 @@ class Store:
     def _assert_lease_owner(
         self, conn: sqlite3.Connection, run_id: str, lease_owner: str | None
     ) -> None:
-        """Fence a committing transaction by the run's current lease owner.
+        """Fence a committing transaction by the run's current active lease.
 
         Raising inside the caller's ``transaction()`` rolls the whole commit
-        back, so once a resumer has taken the lease this owner can land neither
-        business state nor its paired event. ``lease_owner=None`` disables the
-        fence (single-owner paths such as tests and direct store use).
+        back, so once a resumer has taken the lease or the lease has lapsed
+        this owner can land neither business state nor its paired event. A
+        lease only counts while the run is RUNNING, ``lease_owner`` matches the
+        current owner and ``lease_expires_at`` is still in the future.
+        ``lease_owner=None`` disables the fence (single-owner paths such as
+        tests and direct store use).
         """
         if lease_owner is None:
             return
         row = conn.execute(
-            "SELECT lease_owner FROM runs WHERE run_id=?", (run_id,)
+            "SELECT status, lease_owner, lease_expires_at FROM runs WHERE run_id=?",
+            (run_id,),
         ).fetchone()
-        if row is None or row["lease_owner"] != lease_owner:
+        now = now_iso()
+        expired = (
+            row is None
+            or row["lease_expires_at"] is None
+            or row["lease_expires_at"] <= now
+        )
+        if (
+            row is None
+            or row["status"] != "RUNNING"
+            or row["lease_owner"] != lease_owner
+            or expired
+        ):
             raise WFTLeaseLostError(
-                f"run {run_id}: lease no longer held by {lease_owner!r}; "
+                f"run {run_id}: lease no longer held/active for {lease_owner!r}; "
                 "refusing to commit"
             )
 

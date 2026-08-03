@@ -943,6 +943,15 @@ def _take_lease(store: Store, run_id: str, owner: str) -> None:
         )
 
 
+def _expire_lease(store: Store, run_id: str) -> None:
+    """Let the lease lapse while keeping status=RUNNING and the owner."""
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET lease_expires_at=? WHERE run_id=?",
+            ("2020-01-01T00:00:00+00:00", run_id),
+        )
+
+
 def _summary_payload(run_id: str) -> dict:
     return {
         "run_id": run_id,
@@ -1043,19 +1052,20 @@ def test_finalize_run_fenced_by_lease_owner(store: Store) -> None:
 
 
 def test_set_node_task_fenced_by_lease_owner(store: Store) -> None:
-    """A stale owner's checkpoint cannot advance a node task."""
+    """A stale owner's checkpoint raises WFTLeaseLostError, not a plain False."""
     rid = "01HX0" + "A" * 21
     store.create_run(_run_spec(rid))
     store.insert_node_tasks(rid, ["node-a"])
     assert store.start_run(rid, lease_owner="owner-a") is True
     _take_lease(store, rid, "resumer")
-    assert store.set_node_task(
-        rid,
-        "node-a",
-        "RUNNING",
-        event=build_event(rid, "node_started", "node started", node_id="node-a"),
-        lease_owner="owner-a",
-    ) is False
+    with pytest.raises(WFTLeaseLostError):
+        store.set_node_task(
+            rid,
+            "node-a",
+            "RUNNING",
+            event=build_event(rid, "node_started", "node started", node_id="node-a"),
+            lease_owner="owner-a",
+        )
     assert store.get_node_task(rid, "node-a")["status"] == "PENDING"
     assert _event_types(store, rid) == []
     # The current owner's checkpoint still applies: the fence gates the owner.
@@ -1068,3 +1078,79 @@ def test_set_node_task_fenced_by_lease_owner(store: Store) -> None:
     ) is True
     assert store.get_node_task(rid, "node-a")["status"] == "RUNNING"
     assert _event_types(store, rid) == ["node_started"]
+
+
+def test_set_node_task_fenced_when_lease_expired(store: Store) -> None:
+    """Owner unchanged but lease lapsed: the fenced checkpoint must refuse."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    _expire_lease(store, rid)
+    with pytest.raises(WFTLeaseLostError):
+        store.set_node_task(
+            rid,
+            "node-a",
+            "RUNNING",
+            event=build_event(rid, "node_started", "node started", node_id="node-a"),
+            lease_owner="owner-a",
+        )
+    assert store.get_node_task(rid, "node-a")["status"] == "PENDING"
+    assert _event_types(store, rid) == []
+
+
+def test_commit_execution_result_fenced_when_lease_expired(store: Store) -> None:
+    """Owner unchanged but lease lapsed: the commit transaction must roll back."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    _expire_lease(store, rid)
+    execution_uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    with pytest.raises(WFTLeaseLostError):
+        store.commit_execution_result(
+            rid,
+            "node-a",
+            result=_result(rid, "node-a", execution_uid),
+            checkpoint_status="SUCCEEDED",
+            outbox_event={},
+            node_event=build_event(
+                rid, "node_finished", "node finished", node_id="node-a"
+            ),
+            lease_owner="owner-a",
+        )
+    with store.database.connect_migrated() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+    assert _event_types(store, rid) == []
+    assert store.get_node_task(rid, "node-a")["status"] == "PENDING"
+
+
+def test_finalize_run_fenced_when_lease_expired(store: Store) -> None:
+    """Owner unchanged but lease lapsed: finalize cannot land a summary."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    _expire_lease(store, rid)
+    summary = {
+        "meta": {
+            "schema_name": "contract-05-batch-summary",
+            "schema_version": "1.0.0",
+            "producer": "wft.orchestration",
+            "created_at": "2026-08-03T10:00:02+00:00",
+            "run_id": rid,
+            "stage": "orchestration",
+        },
+        "payload": _summary_payload(rid),
+    }
+    with pytest.raises(WFTLeaseLostError):
+        store.finalize_run(
+            rid,
+            run_status="SUCCESS",
+            batch_status="success",
+            summary=summary,
+            outbox_event={},
+            final_event=build_event(rid, "run_completed", "run completed"),
+            lease_owner="owner-a",
+        )
+    assert store.get_run(rid)["status"] == "RUNNING"
+    assert store.get_batch_summary(rid) is None
