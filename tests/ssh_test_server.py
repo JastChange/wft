@@ -8,7 +8,9 @@ in real ``/tmp``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import shlex
 import signal as _signal
 
 import asyncssh
@@ -144,6 +146,27 @@ _SIGNALS = {name: getattr(_signal, "SIG" + name) for name in ("TERM", "KILL", "I
 async def _run_command(process: asyncssh.SSHServerProcess) -> None:
     try:
         command = process.channel.get_command() or ""
+        # The fixture emulates a Linux target, but the test server itself runs
+        # on the GitHub macOS runner.  Implement only the exact sha256sum form
+        # used by the production integrity check so tests do not depend on a
+        # host-specific GNU utility.
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        if len(argv) == 2 and argv[0] == "sha256sum":
+            path = argv[1]
+            if not os.path.isfile(path):
+                process.stderr.write(b"sha256sum: missing file\n")
+                process.exit(1)
+                return
+            digest = hashlib.sha256()
+            with open(path, "rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            process.stdout.write(f"{digest.hexdigest()}  {path}\n".encode())
+            process.exit(0)
+            return
         # Emulate a Linux target: ensure /sbin|/usr/sbin (where sha256sum
         # lives on macOS) are on PATH regardless of the host shell profile.
         env = {**os.environ, "PATH": "/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin"}
