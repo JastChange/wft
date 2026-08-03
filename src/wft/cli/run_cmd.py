@@ -194,19 +194,23 @@ def _reused_run(args: argparse.Namespace, store: Store, run_id: str) -> int:
 
 def _report(args: argparse.Namespace, outcome: RunOutcome) -> None:
     if outcome.lease_lost:
+        # The DB Run stays RUNNING for a resumer and this process cannot form
+        # an authoritative summary, so report the contract status RUNNING with
+        # exit 2 (owner loss / no final trusted result), never an invented
+        # status such as INTERRUPTED.
         if args.json:
             emit_json(
                 envelope("contract-01-envelope", {
                     "command": "run",
                     "ok": False,
                     "run_id": outcome.run_id,
-                    "run_status": "INTERRUPTED",
+                    "run_status": "RUNNING",
                     "error": "lease lost; run left RUNNING for resume",
                 })
             )
         else:
             print(
-                f"run {outcome.run_id}: INTERRUPTED — lease lost; "
+                f"run {outcome.run_id}: RUNNING — lease lost; "
                 "run left RUNNING for resume"
             )
         return

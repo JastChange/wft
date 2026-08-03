@@ -339,14 +339,65 @@ def test_lease_loss_cancels_inflight_and_leaves_run_for_resume(
         )
     )
     assert outcome.lease_lost is True
-    assert outcome.run_status == "INTERRUPTED"
-    assert outcome.exit_code == 1
+    # The authoritative state machine has no INTERRUPTED: the DB Run stays
+    # RUNNING for the resumer and this process reports that contract state with
+    # exit 2 (no final trusted result).
+    assert outcome.run_status == "RUNNING"
+    assert outcome.exit_code == 2
     assert outcome.summary == {}
-    # The Run is left RUNNING for a resumer; no final summary, no commits.
     assert store.get_run(run_id)["status"] == "RUNNING"
     assert store.get_batch_summary(run_id) is None
     with store.database.connect_migrated() as conn:
         assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+    for task in store.get_node_tasks(run_id):
+        assert task["status"] not in ("SUCCEEDED", "FAILED")
+
+
+def test_lease_loss_during_commit_is_closed(tmp_path: Path, monkeypatch) -> None:
+    """A resumer stealing the lease in the commit window closes the run.
+
+    run_one must catch WFTLeaseLostError across the whole checkpoint -> execute
+    -> commit boundary: the owner's commit is fenced out, in-flight siblings
+    are cancelled, and nothing is committed or finalized.
+    """
+    script = _script(_scratch(tmp_path))
+    nodes = [_node("node-a", tmp_path / "key"), _node("node-b", tmp_path / "key")]
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id, _ = create_run(store, spec, [n["node_id"] for n in nodes])
+
+    async def _fake(**kwargs):
+        nid = kwargs["node"]["node_id"]
+        if nid == "node-a":
+            # An external resumer takes the lease while the node is executing.
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE runs SET lease_owner='resumer' WHERE run_id=?",
+                    (run_id,),
+                )
+            return ExecutionOutcome(exit_code=0, stdout=b"ok\n", stderr=b"")
+        await asyncio.sleep(60)  # in-flight until node-a's loss cancels us
+        return ExecutionOutcome(exit_code=0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr(run_mod, "execute_script", _fake)
+    outcome = asyncio.run(
+        execute_run(
+            store,
+            run_id=run_id,
+            run_spec=spec,
+            nodes=nodes,
+            script=script,
+            known_hosts_path=None,
+        )
+    )
+    assert outcome.lease_lost is True
+    assert outcome.run_status == "RUNNING"
+    assert outcome.exit_code == 2
+    assert outcome.summary == {}
+    with store.database.connect_migrated() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+    assert store.get_batch_summary(run_id) is None
+    assert store.get_run(run_id)["status"] == "RUNNING"
     for task in store.get_node_tasks(run_id):
         assert task["status"] not in ("SUCCEEDED", "FAILED")
 

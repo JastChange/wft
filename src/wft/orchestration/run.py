@@ -139,8 +139,9 @@ async def execute_run(
     ``global_concurrency`` semaphore and paced by ``connect_rate_per_sec``;
     per-node concurrency is 1 (one logical execution per node). A heartbeat
     renews the run lease every ``HEARTBEAT_INTERVAL_SEC``; if it fails the run
-    stops dispatching, cancels in-flight nodes and returns INTERRUPTED without
-    finalizing (a resumer will own the RUNNING run). Every commit is fenced by
+    stops dispatching, cancels in-flight nodes and returns ``run_status
+    RUNNING`` with exit 2 without finalizing (the DB Run stays RUNNING for a
+    resumer; no authoritative summary exists). Every commit is fenced by
     ``lease_owner`` so an owner who lost the lease can never write execution/
     checkpoint/outbox/event against a reclaimed run.
     """
@@ -207,26 +208,28 @@ async def execute_run(
         async with throttle.global_semaphore:
             if lease_lost.is_set():
                 return None
-            if not store.set_node_task(
-                run_id,
-                node_id,
-                "RUNNING",
-                lease_owner=lease_owner,
-                event=build_event(
-                    run_id,
-                    "node_started",
-                    f"node {node_id} started",
-                    severity="debug",
-                    node_id=node_id,
-                ),
-            ):
-                if lease_lost.is_set():
-                    return None
-                raise WFTError(
-                    f"node {node_id}: cannot transition to RUNNING "
-                    "(terminal node task cannot be rewritten)"
-                )
             try:
+                # The whole checkpoint -> execute -> commit boundary is one
+                # fenced critical section: a WFTLeaseLostError from any fenced
+                # write (checkpoint or commit) closes the run immediately -- set
+                # the lease-lost flag, cancel siblings, return no outcome.
+                if not store.set_node_task(
+                    run_id,
+                    node_id,
+                    "RUNNING",
+                    lease_owner=lease_owner,
+                    event=build_event(
+                        run_id,
+                        "node_started",
+                        f"node {node_id} started",
+                        severity="debug",
+                        node_id=node_id,
+                    ),
+                ):
+                    raise WFTError(
+                        f"node {node_id}: cannot transition to RUNNING "
+                        "(terminal node task cannot be rewritten)"
+                    )
                 result, degraded_node, secondary_errors, attempts = await _execute_node(
                     store,
                     run_id,
@@ -236,60 +239,64 @@ async def execute_run(
                     limits,
                     connect_limiter=throttle.connect_limiter,
                 )
+                if lease_lost.is_set():
+                    return None
+                payload = result["payload"]
+                status = payload["status"]
+                # Per-node per-class-once aggregation (错误矩阵_v0.1.md): the
+                # primary error counts once, then any secondary blob/decode
+                # errors that could not fit the single Contract-03 error slot.
+                error_counts: dict[str, int] = {}
+                counted: set[str] = set()
+                error = payload.get("error")
+                if error is not None:
+                    error_counts[error["class"]] = 1
+                    counted.add(error["class"])
+                for sec in secondary_errors:
+                    if sec["class"] not in counted:
+                        error_counts[sec["class"]] = 1
+                        counted.add(sec["class"])
+                store.commit_execution_result(
+                    run_id,
+                    node_id,
+                    result=result,
+                    checkpoint_status=status,
+                    lease_owner=lease_owner,
+                    outbox_event=build_outbox_event(
+                        object_type="execution_result",
+                        object_id=payload["execution_uid"],
+                        event_type="execution_result.completed",
+                        payload=payload,
+                    ),
+                    node_event=build_event(
+                        run_id,
+                        "node_finished",
+                        f"node {node_id} {status.lower()}",
+                        severity="warning" if status != "SUCCEEDED" else "info",
+                        node_id=node_id,
+                        execution_uid=payload["execution_uid"],
+                        data={
+                            "status": status,
+                            # Blob/decode errors that could not fit the single
+                            # Contract-03 error slot, persisted so per-node
+                            # detail is auditable even if the process dies
+                            # before the batch summary is committed.
+                            "secondary_errors": [dict(e) for e in secondary_errors],
+                        },
+                    ),
+                    attempts=attempts,
+                )
             except asyncio.CancelledError:
                 raise
             except WFTLeaseLostError:
+                # A resumer took the lease during this node's checkpoint/execute/
+                # commit window: stop dispatching, cancel in-flight nodes and
+                # leave the Run RUNNING for the resumer (nothing committed).
                 lease_lost.set()
                 for task in node_tasks:
                     if task is not asyncio.current_task():
                         task.cancel()
                 return None
-            if lease_lost.is_set():
-                return None
-            payload = result["payload"]
-            status = payload["status"]
-            # Per-node per-class-once aggregation (错误矩阵_v0.1.md): the primary
-            # error counts once, then any secondary blob/decode errors that could
-            # not fit the single Contract-03 error slot.
-            error_counts: dict[str, int] = {}
-            counted: set[str] = set()
-            error = payload.get("error")
-            if error is not None:
-                error_counts[error["class"]] = 1
-                counted.add(error["class"])
-            for sec in secondary_errors:
-                if sec["class"] not in counted:
-                    error_counts[sec["class"]] = 1
-                    counted.add(sec["class"])
-            store.commit_execution_result(
-                run_id,
-                node_id,
-                result=result,
-                checkpoint_status=status,
-                lease_owner=lease_owner,
-                outbox_event=build_outbox_event(
-                    object_type="execution_result",
-                    object_id=payload["execution_uid"],
-                    event_type="execution_result.completed",
-                    payload=payload,
-                ),
-                node_event=build_event(
-                    run_id,
-                    "node_finished",
-                    f"node {node_id} {status.lower()}",
-                    severity="warning" if status != "SUCCEEDED" else "info",
-                    node_id=node_id,
-                    execution_uid=payload["execution_uid"],
-                    data={
-                        "status": status,
-                        # Blob/decode errors that could not fit the single Contract-03
-                        # error slot, persisted so per-node detail is auditable even if
-                        # the process dies before the batch summary is committed.
-                        "secondary_errors": [dict(e) for e in secondary_errors],
-                    },
-                ),
-                attempts=attempts,
-            )
             return _NodeOutcome(
                 node_id=node_id,
                 status=status,
@@ -321,13 +328,16 @@ async def execute_run(
         nodes, completed
     )
     if lease_lost.is_set():
+        # No authoritative final summary is possible: the DB Run stays RUNNING
+        # for the resumer, so report that contract state with exit 2 (owner
+        # loss / no final trusted result), never an invented status.
         return RunOutcome(
             run_id=run_id,
-            run_status="INTERRUPTED",
+            run_status="RUNNING",
             batch_status=None,
             counts=counts,
             error_counts=error_counts,
-            exit_code=1,
+            exit_code=2,
             duration_ms=duration_ms,
             summary={},
             lease_lost=True,
@@ -367,14 +377,15 @@ async def execute_run(
             final_event=build_event(run_id, final_event_type, final_message),
         )
     except WFTLeaseLostError:
-        # A resumer took the lease in the finalize window: abandon, leave RUNNING.
+        # A resumer took the lease in the finalize window: abandon, leave the
+        # DB Run RUNNING and report that state with exit 2 (no final summary).
         return RunOutcome(
             run_id=run_id,
-            run_status="INTERRUPTED",
+            run_status="RUNNING",
             batch_status=None,
             counts=counts,
             error_counts=error_counts,
-            exit_code=1,
+            exit_code=2,
             duration_ms=duration_ms,
             summary={},
             lease_lost=True,
