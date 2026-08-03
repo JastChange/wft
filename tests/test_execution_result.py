@@ -105,6 +105,20 @@ def test_hard_cap_truncates_tail(blobs: BlobStore) -> None:
     assert degraded is False
 
 
+def test_pre_capped_tail_reports_total_overflow(blobs: BlobStore) -> None:
+    # The SSH layer already capped the tail to the hard cap; the original total
+    # (which exceeds the cap) must still mark the stream truncated.
+    tail = b"Z" * STREAM_HARD_CAP
+    stream, flags, degraded = build_stream(
+        "stdout", tail, blobs, total_bytes=STREAM_HARD_CAP + 5000
+    )
+    assert stream["bytes"] == STREAM_HARD_CAP
+    assert stream["truncated"] is True
+    assert "truncated" in flags
+    assert "output_overflow" in flags
+    assert degraded is False
+
+
 def test_non_utf8_binary_blob_degrades(blobs: BlobStore) -> None:
     data = b"\xff\xfe binary \x00 bytes"
     stream, flags, degraded = build_stream("stdout", data, blobs)

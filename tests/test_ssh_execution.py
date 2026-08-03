@@ -13,6 +13,7 @@ from pathlib import Path
 import asyncssh
 import pytest
 
+from wft.execution.result import STREAM_HARD_CAP
 from wft.execution.ssh import execute_script
 from wft.scriptreg.registry import Script
 
@@ -104,6 +105,35 @@ def test_success_execution(tmp_path: Path) -> None:
     assert outcome.duration_ms >= 0
     # The temp script must be cleaned up from the real filesystem.
     assert not list(tmp_path.rglob("wft-*.sh"))
+
+
+def test_large_output_keeps_tail_and_tracks_total(tmp_path: Path) -> None:
+    # 2 MiB of output: the client must drain it all but keep only the 1 MiB
+    # tail in memory, while still reporting the full byte count.
+    size = 2 * STREAM_HARD_CAP
+    script_path = tmp_path / "big.sh"
+    script_path.write_text(
+        "#!/bin/bash\n"
+        f'python3 -c "import sys; sys.stdout.write(\'a\' * {size})"\n',
+        encoding="utf-8",
+    )
+    script = _script(script_path)
+
+    outcome = _run_server_and(
+        lambda host, port, key_path, known_hosts_path: execute_script(
+            node=_node(host, port, key_path=key_path),
+            script=script,
+            known_hosts_path=known_hosts_path,
+            connect_timeout_sec=5,
+            exec_timeout_sec=10,
+        ),
+        tmp_path,
+    )
+    assert outcome.error is None
+    assert outcome.exit_code == 0
+    assert outcome.stdout_total == size
+    assert len(outcome.stdout) == STREAM_HARD_CAP
+    assert outcome.stdout == b"a" * STREAM_HARD_CAP
 
 
 def test_nonzero_exit_captured(tmp_path: Path) -> None:

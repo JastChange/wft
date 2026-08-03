@@ -20,11 +20,13 @@ from pathlib import Path
 import asyncssh
 
 from wft.contracts.errors import WFTExecutionError
+from wft.execution.result import STREAM_HARD_CAP
 from wft.scriptreg.registry import Script
 
 from .errors import error_dict
 
 _AUTH_FAILED = "auth_failed"
+_DRAIN_CHUNK = 64 * 1024
 
 
 @dataclass
@@ -34,6 +36,10 @@ class ExecutionOutcome:
     stderr: bytes = b""
     error: dict | None = None
     duration_ms: int = 0
+    # Total bytes read on each stream before the tail was trimmed. The result
+    # builder uses these to decide ``truncated`` once the tail is capped.
+    stdout_total: int = 0
+    stderr_total: int = 0
 
 
 async def execute_script(
@@ -122,11 +128,9 @@ async def _run_remote(
         )
 
     try:
-        proc = await conn.run(
-            f"{script.shell} {shlex.quote(remote_path)}",
-            check=False,
+        return await asyncio.wait_for(
+            _run_process(conn, f"{script.shell} {shlex.quote(remote_path)}"),
             timeout=exec_timeout_sec,
-            encoding=None,
         )
     except asyncio.TimeoutError:
         return ExecutionOutcome(
@@ -137,11 +141,52 @@ async def _run_remote(
     except (asyncssh.Error, OSError) as exc:
         return ExecutionOutcome(error=_map_connection_error(exc))
 
+
+async def _run_process(conn: asyncssh.SSHClientConnection, cmd: str) -> ExecutionOutcome:
+    """Stream the process stdout/stderr with a bounded tail (see ``_drain``).
+
+    The exec timeout is applied by the caller with ``asyncio.wait_for``; on
+    cancellation the remote process is terminated so it cannot keep running.
+    """
+    proc = await conn.create_process(cmd, encoding=None)
+    try:
+        (stdout_tail, stdout_total), (stderr_tail, stderr_total) = await asyncio.gather(
+            _drain(proc.stdout, STREAM_HARD_CAP),
+            _drain(proc.stderr, STREAM_HARD_CAP),
+        )
+        await proc.wait()
+    except BaseException:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise
     return ExecutionOutcome(
         exit_code=proc.exit_status,
-        stdout=proc.stdout or b"",
-        stderr=proc.stderr or b"",
+        stdout=stdout_tail,
+        stderr=stderr_tail,
+        stdout_total=stdout_total,
+        stderr_total=stderr_total,
     )
+
+
+async def _drain(reader, cap: int) -> tuple[bytes, int]:
+    """Drain ``reader`` to EOF, retaining only the last ``cap`` bytes.
+
+    Every chunk is read so the remote process is never blocked on a full pipe,
+    but at most ``cap`` bytes are kept (head dropped) to bound client memory.
+    """
+    total = 0
+    tail = bytearray()
+    while True:
+        chunk = await reader.read(_DRAIN_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        tail.extend(chunk)
+        if len(tail) > cap:
+            del tail[: len(tail) - cap]
+    return bytes(tail), total
 
 
 def _auth_options(node: dict) -> dict:

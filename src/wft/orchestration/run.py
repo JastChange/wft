@@ -321,6 +321,8 @@ async def _execute_node(
             exit_code=outcome.exit_code,
             stdout_bytes=outcome.stdout,
             stderr_bytes=outcome.stderr,
+            stdout_total=outcome.stdout_total,
+            stderr_total=outcome.stderr_total,
             error=final_error,
             blobs=store.blobs,
             extra_flags=("retried",) if attempt_count > 1 else (),

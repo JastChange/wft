@@ -34,11 +34,18 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def build_stream(name: str, data: bytes, blobs: BlobStore) -> tuple[dict, list[str], bool]:
+def build_stream(
+    name: str,
+    data: bytes,
+    blobs: BlobStore,
+    total_bytes: int | None = None,
+) -> tuple[dict, list[str], bool]:
     """Return ``(stream_dict, flags, degraded)`` for a stdout/stderr stream.
 
     ``degraded`` is True when the bytes are not valid UTF-8 (binary content),
-    which the caller must propagate to the run-level status.
+    which the caller must propagate to the run-level status. When the SSH layer
+    already capped the tail (``total_bytes`` > the data length), ``truncated``
+    is decided from the original total instead of the capped ``data``.
     """
     inline_cap = INLINE_STDOUT_CAP if name == "stdout" else INLINE_STDERR_CAP
     flags: list[str] = []
@@ -49,7 +56,8 @@ def build_stream(name: str, data: bytes, blobs: BlobStore) -> tuple[dict, list[s
         encoding = "binary"
 
     content = data if len(data) <= STREAM_HARD_CAP else data[-STREAM_HARD_CAP:]
-    truncated = len(content) < len(data)
+    total = len(data) if total_bytes is None else total_bytes
+    truncated = total > STREAM_HARD_CAP
     if truncated:
         flags.extend(["truncated", "output_overflow"])
 
@@ -123,6 +131,8 @@ def build_execution_result(
     blobs: BlobStore,
     extra_flags: tuple[str, ...] = (),
     produced_at: str | None = None,
+    stdout_total: int | None = None,
+    stderr_total: int | None = None,
 ) -> tuple[dict, bool]:
     """Build and validate a Contract-03 envelope; return ``(envelope, degraded)``.
 
@@ -130,8 +140,12 @@ def build_execution_result(
     then treat the run as DEGRADED. Raises :class:`WFTContractError` if the
     built envelope fails Contract-03 validation (a developer bug).
     """
-    stdout_stream, stdout_flags, stdout_degraded = build_stream("stdout", stdout_bytes, blobs)
-    stderr_stream, stderr_flags, stderr_degraded = build_stream("stderr", stderr_bytes, blobs)
+    stdout_stream, stdout_flags, stdout_degraded = build_stream(
+        "stdout", stdout_bytes, blobs, total_bytes=stdout_total
+    )
+    stderr_stream, stderr_flags, stderr_degraded = build_stream(
+        "stderr", stderr_bytes, blobs, total_bytes=stderr_total
+    )
     flags = sorted(set([*stdout_flags, *stderr_flags, *extra_flags]))
     unknown = set(flags) - FLAG_VALUES
     if unknown:
