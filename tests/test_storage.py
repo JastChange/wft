@@ -12,7 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from wft.contracts.errors import WFTIdempotencyConflict, WFTStorageError
+from wft.contracts.errors import (
+    WFTIdempotencyConflict,
+    WFTLeaseLostError,
+    WFTStorageError,
+)
 from wft.storage.blobs import BlobStore
 from wft.storage.db import Database
 from wft.storage.schema import SCHEMA_VERSION, migrate
@@ -926,3 +930,141 @@ def test_find_orphan_blobs_identifies_unreferenced(tmp_path: Path) -> None:
     # The committed blob is complete on disk and not an orphan.
     assert store.blobs.read(kept) == b"x" * (300 * 1024)
     assert store.find_orphan_blobs() == [orphan]
+
+
+# ----------------------------------------------- lease fencing on commit paths
+
+
+def _take_lease(store: Store, run_id: str, owner: str) -> None:
+    """Simulate a resumer claiming the lease by rewriting runs.lease_owner."""
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE runs SET lease_owner=? WHERE run_id=?", (owner, run_id)
+        )
+
+
+def _summary_payload(run_id: str) -> dict:
+    return {
+        "run_id": run_id,
+        "run_status": "SUCCESS",
+        "batch_status": "success",
+        "summary_revision": 1,
+        "final": True,
+        "counts": {
+            "targeted": 1, "succeeded": 1, "failed": 0,
+            "unknown": 0, "cancelled": 0, "skipped": 0,
+        },
+        "error_counts": {},
+        "started_at": "2026-08-03T10:00:01+00:00",
+        "finished_at": "2026-08-03T10:00:02+00:00",
+        "duration_ms": 1000,
+        "exit_code": 0,
+    }
+
+
+def test_commit_execution_result_fenced_by_lease_owner(store: Store) -> None:
+    """A lost owner can commit neither execution nor its paired event/outbox."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    _take_lease(store, rid, "resumer")
+    execution_uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    with pytest.raises(WFTLeaseLostError):
+        store.commit_execution_result(
+            rid,
+            "node-a",
+            result=_result(rid, "node-a", execution_uid),
+            checkpoint_status="SUCCEEDED",
+            outbox_event={},
+            node_event=build_event(
+                rid, "node_finished", "node finished", node_id="node-a"
+            ),
+            lease_owner="owner-a",
+        )
+    # Nothing landed: no execution row, no event, checkpoint untouched.
+    with store.database.connect_migrated() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 0
+    assert _event_types(store, rid) == []
+    assert store.get_node_task(rid, "node-a")["status"] == "PENDING"
+
+
+def test_commit_execution_result_succeeds_for_current_owner(store: Store) -> None:
+    """The fence admits the owner who still holds the lease."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    execution_uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    store.commit_execution_result(
+        rid,
+        "node-a",
+        result=_result(rid, "node-a", execution_uid),
+        checkpoint_status="SUCCEEDED",
+        outbox_event={},
+        node_event=build_event(
+            rid, "node_finished", "node finished", node_id="node-a"
+        ),
+        lease_owner="owner-a",
+    )
+    assert store.get_node_task(rid, "node-a")["status"] == "SUCCEEDED"
+    assert "node_finished" in _event_types(store, rid)
+
+
+def test_finalize_run_fenced_by_lease_owner(store: Store) -> None:
+    """A lost owner cannot finalize (summary/outbox/final event) a reclaimed run."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    _take_lease(store, rid, "resumer")
+    summary = {
+        "meta": {
+            "schema_name": "contract-05-batch-summary",
+            "schema_version": "1.0.0",
+            "producer": "wft.orchestration",
+            "created_at": "2026-08-03T10:00:02+00:00",
+            "run_id": rid,
+            "stage": "orchestration",
+        },
+        "payload": _summary_payload(rid),
+    }
+    with pytest.raises(WFTLeaseLostError):
+        store.finalize_run(
+            rid,
+            run_status="SUCCESS",
+            batch_status="success",
+            summary=summary,
+            outbox_event={},
+            final_event=build_event(rid, "run_completed", "run completed"),
+            lease_owner="owner-a",
+        )
+    assert store.get_run(rid)["status"] == "RUNNING"
+    assert store.get_batch_summary(rid) is None
+
+
+def test_set_node_task_fenced_by_lease_owner(store: Store) -> None:
+    """A stale owner's checkpoint cannot advance a node task."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.start_run(rid, lease_owner="owner-a") is True
+    _take_lease(store, rid, "resumer")
+    assert store.set_node_task(
+        rid,
+        "node-a",
+        "RUNNING",
+        event=build_event(rid, "node_started", "node started", node_id="node-a"),
+        lease_owner="owner-a",
+    ) is False
+    assert store.get_node_task(rid, "node-a")["status"] == "PENDING"
+    assert _event_types(store, rid) == []
+    # The current owner's checkpoint still applies: the fence gates the owner.
+    assert store.set_node_task(
+        rid,
+        "node-a",
+        "RUNNING",
+        event=build_event(rid, "node_started", "node started", node_id="node-a"),
+        lease_owner="resumer",
+    ) is True
+    assert store.get_node_task(rid, "node-a")["status"] == "RUNNING"
+    assert _event_types(store, rid) == ["node_started"]

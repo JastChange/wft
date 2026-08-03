@@ -15,7 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from wft.contracts.errors import WFTError, WFTIdempotencyConflict, WFTStorageError
+from wft.contracts.errors import (
+    WFTError,
+    WFTIdempotencyConflict,
+    WFTLeaseLostError,
+    WFTStorageError,
+)
 from wft.contracts.validate import validate_contract
 
 from .blobs import BlobStore
@@ -251,23 +256,30 @@ class Store:
         execution_uid: str | None = None,
         error_class: str | None = None,
         event: dict | None = None,
+        lease_owner: str | None = None,
     ) -> bool:
         """Transition a node task under CAS; False when the rewrite is illegal.
 
         Terminal statuses may never be rewritten and RUNNING may only follow a
         non-terminal state, so a finished node cannot be silently re-flagged.
+        When ``lease_owner`` is given, the checkpoint is fenced: the update only
+        applies while the run's current lease owner matches, so an owner who
+        lost the lease (to a resumer) can never advance a node checkpoint.
         When the transition applies, ``event`` (a Contract-09 envelope) is
         written in the same transaction as the checkpoint update, so a node
         state change and its audit can never land on only one side.
         """
         now = now_iso()
+        fence = " AND EXISTS (SELECT 1 FROM runs WHERE run_id=? AND lease_owner=?)"
         with self.transaction() as conn:
             if status in ("RUNNING",):
                 cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, "
                     "started_at=COALESCE(started_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')",
-                    (status, execution_uid, now, now, run_id, node_id),
+                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')"
+                    + (fence if lease_owner is not None else ""),
+                    (status, execution_uid, now, now, run_id, node_id)
+                    + (() if lease_owner is None else (run_id, lease_owner)),
                 )
             else:
                 # A terminal status may only be set from a writable
@@ -276,8 +288,10 @@ class Store:
                 cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
                     "finished_at=COALESCE(finished_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')",
-                    (status, execution_uid, error_class, now, now, run_id, node_id),
+                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')"
+                    + (fence if lease_owner is not None else ""),
+                    (status, execution_uid, error_class, now, now, run_id, node_id)
+                    + (() if lease_owner is None else (run_id, lease_owner)),
                 )
             if cur.rowcount == 1 and event is not None:
                 self._insert_event(conn, run_id, event)
@@ -295,21 +309,27 @@ class Store:
         outbox_event: dict,
         node_event: dict,
         attempts: list[dict] | None = None,
+        lease_owner: str | None = None,
     ) -> dict:
         """Atomically persist ExecutionResult + final attempt + checkpoint + outbox + event.
 
         ``result`` is a Contract-03 envelope; ``attempts`` are the per-attempt
         rows for this execution; ``outbox_event`` and ``node_event`` are the
-        real outbox row and the Contract-09 event. The write is immutable on
-        ``execution_uid`` (AC-011): a replay with identical content returns the
-        original ack, a replay with different content raises
-        :class:`WFTIdempotencyConflict`.
+        real outbox row and the Contract-09 event. When ``lease_owner`` is
+        given the write is fenced: the whole transaction refuses to apply once
+        the run's current lease owner is no longer ``lease_owner`` (a resumer
+        took over), raising :class:`WFTLeaseLostError` so an ex-owner can never
+        commit execution/checkpoint/outbox/event against a reclaimed run. The
+        write is immutable on ``execution_uid`` (AC-011): a replay with
+        identical content returns the original ack, a replay with different
+        content raises :class:`WFTIdempotencyConflict`.
         """
         payload = result["payload"]
         execution_uid = payload["execution_uid"]
         now = now_iso()
         ack_event_ids: list[str] = []
         with self.transaction() as conn:
+            self._assert_lease_owner(conn, run_id, lease_owner)
             existing = conn.execute(
                 "SELECT result_json, created_at FROM executions WHERE execution_uid=?",
                 (execution_uid,),
@@ -407,17 +427,23 @@ class Store:
         summary: dict,
         outbox_event: dict,
         final_event: dict,
+        lease_owner: str | None = None,
     ) -> dict:
         """Atomically persist the final BatchSummary + run terminal state.
 
         The Run UPDATE is the single terminal transition: only when it changes
-        exactly one row are the summary/outbox/event written. A repeated
-        finalize of an already-terminal Run is an idempotent replay (identical
-        summary returns the original ack; different content raises conflict).
+        exactly one row are the summary/outbox/event written. When
+        ``lease_owner`` is given the finalize is fenced: once the run's current
+        lease owner is no longer ``lease_owner`` (a resumer took over) the
+        whole transaction refuses, raising :class:`WFTLeaseLostError`, so an
+        ex-owner can never finalize a reclaimed run. A repeated finalize of an
+        already-terminal Run is an idempotent replay (identical summary returns
+        the original ack; different content raises conflict).
         """
         now = now_iso()
         ack_event_ids: list[str] = []
         with self.transaction() as conn:
+            self._assert_lease_owner(conn, run_id, lease_owner)
             cur = conn.execute(
                 "UPDATE runs SET status=?, batch_status=?, finished_at=?, updated_at=? "
                 "WHERE run_id=? AND status NOT IN ('SUCCESS','DEGRADED','FAILED','CANCELLED')",
@@ -468,6 +494,27 @@ class Store:
         return self._persist_ack("batch_summary", run_id, now, ack_event_ids)
 
     # ------------------------------------------------------------ helpers
+
+    def _assert_lease_owner(
+        self, conn: sqlite3.Connection, run_id: str, lease_owner: str | None
+    ) -> None:
+        """Fence a committing transaction by the run's current lease owner.
+
+        Raising inside the caller's ``transaction()`` rolls the whole commit
+        back, so once a resumer has taken the lease this owner can land neither
+        business state nor its paired event. ``lease_owner=None`` disables the
+        fence (single-owner paths such as tests and direct store use).
+        """
+        if lease_owner is None:
+            return
+        row = conn.execute(
+            "SELECT lease_owner FROM runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None or row["lease_owner"] != lease_owner:
+            raise WFTLeaseLostError(
+                f"run {run_id}: lease no longer held by {lease_owner!r}; "
+                "refusing to commit"
+            )
 
     def _insert_event(self, conn: sqlite3.Connection, run_id: str, event: dict) -> None:
         payload = event["payload"]

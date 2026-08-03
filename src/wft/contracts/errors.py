@@ -35,3 +35,9 @@ class WFTStorageError(WFTError):
 
 class WFTExecutionError(WFTError):
     """A node execution could not be attempted (bad auth ref, bad config)."""
+
+
+class WFTLeaseLostError(WFTError):
+    """A commit was fenced out because the run's lease no longer belongs to
+    the writer (a resumer took it over, or it expired). The write is refused
+    and the transaction is rolled back."""
