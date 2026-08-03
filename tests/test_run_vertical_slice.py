@@ -800,6 +800,13 @@ def _seed_config(tmp_path: Path) -> tuple[Path, Store]:
     return config, Store(Database(data_dir / "wft.db"))
 
 
+def _config_snapshot_hash(inventory_path: Path, script_path: Path) -> str:
+    h = hashlib.sha256()
+    for path in (inventory_path, script_path):
+        h.update(path.resolve().read_bytes())
+    return h.hexdigest()
+
+
 def test_cli_run_resume_mutex_rejects_new_run_args(tmp_path: Path) -> None:
     """--resume is mutually exclusive with every new-run arg (exit 2)."""
     for extra in (
@@ -866,6 +873,75 @@ def test_cli_run_resume_stale_but_unrecoverable_script_exit_two(tmp_path: Path) 
     # The recovery CAS was never attempted: owner and resume_count unchanged.
     assert store.get_run(run_id)["lease_owner"] == "worker-1"
     assert store.get_run(run_id)["resume_count"] == 0
+
+
+def test_cli_run_resume_config_snapshot_mismatch_exit_two(tmp_path: Path) -> None:
+    """Resume refuses (exit 2) when the inventory changed since the original run
+    -- even keeping the same node_id but altering host -- before the lock claim,
+    with owner / resume_count / events untouched."""
+    config, store = _seed_config(tmp_path)
+    script_path = tmp_path / "ok.sh"
+    script_path.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+    script = _script(script_path)
+    inventory = tmp_path / "inventory.yaml"
+    inventory.write_text(
+        "nodes:\n"
+        "  - node_id: node-a\n"
+        "    host: 127.0.0.1\n    port: 22\n"
+        "    username: tester\n"
+        "    auth:\n"
+        "      method: key\n"
+        f"      credential_ref: file://{tmp_path / 'key'}\n"
+        "    groups: [web]\n    tags: []\n",
+        encoding="utf-8",
+    )
+    scripts = tmp_path / "scripts.yaml"
+    scripts.write_text(
+        "scripts:\n"
+        "  - name: disk-usage\n"
+        f"    path: {script_path.name}\n"
+        f"    sha256: {_sha_file(script_path)}\n"
+        "    risk: read_only\n    shell: bash\n"
+        "    timeout_sec: 30\n    enabled: true\n"
+        "    expected_exit_codes: [0]\n",
+        encoding="utf-8",
+    )
+    spec = build_run_spec(
+        run_id=new_run_id(),
+        trigger_type="manual",
+        actor="tester",
+        requested_at=now_iso(),
+        inventory_ref=str(inventory),
+        selector={"groups": ["web"], "tags": []},
+        script=script,
+        limits=_limits(script),
+        config_snapshot_hash=_config_snapshot_hash(inventory, script_path),
+    )
+    run_id, _ = create_run(store, spec, ["node-a"])
+    assert store.start_run(run_id, lease_owner="worker-1")
+    _age_run_lease(store, run_id)
+    with store.database.connect_migrated() as conn:
+        events_before = conn.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+
+    # Same node_id but the host changed: resume must refuse before the CAS.
+    inventory.write_text(
+        inventory.read_text(encoding="utf-8").replace("127.0.0.1", "192.168.9.9"),
+        encoding="utf-8",
+    )
+    proc = run_cli("run", "--resume", run_id, "--config", str(config),
+                   "--scripts", str(scripts))
+    assert proc.returncode == 2
+    assert "config snapshot mismatch" in proc.stderr
+    run = store.get_run(run_id)
+    assert run["lease_owner"] == "worker-1"
+    assert run["resume_count"] == 0
+    with store.database.connect_migrated() as conn:
+        events_after = conn.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id=?", (run_id,)
+        ).fetchone()[0]
+    assert events_after == events_before  # no audit written by the refused resume
 
 
 def test_cli_run_resume_after_kill9_recovers_stale_run(tmp_path: Path) -> None:

@@ -236,6 +236,16 @@ def _resume(args: argparse.Namespace) -> int:
     inventory_path = Path(payload["inventory_ref"])
     inv_payload, line_index = load_yaml_with_lines(inventory_path)
     ensure_inventory_valid(inv_payload, source=str(inventory_path), line_index=line_index)
+    # Resume only applies to the exact config the original run executed: the
+    # sha256 of the inventory bytes + strictly-matched script bytes must equal
+    # the recorded hash. A changed inventory/script -- even one that keeps the
+    # same node_ids but alters host/auth -- is refused before the recovery CAS,
+    # so owner/resume_count/events stay untouched.
+    if _config_snapshot_hash(inventory_path, script.path) != payload["config_snapshot_hash"]:
+        raise WFTError(
+            f"run {run_id}: config snapshot mismatch — the inventory or script "
+            "changed since the original run; refusing to resume (exit 2)"
+        )
     by_id = {node["node_id"]: node for node in inv_payload.get("nodes", [])}
     target_ids = [task["node_id"] for task in store.get_node_tasks(run_id)]
     missing = [node_id for node_id in target_ids if node_id not in by_id]
@@ -324,11 +334,16 @@ def _reused_run(args: argparse.Namespace, store: Store, run_id: str) -> int:
 
 
 def _report(args: argparse.Namespace, outcome: RunOutcome) -> None:
-    if outcome.lease_lost:
-        # The DB Run stays RUNNING for a resumer and this process cannot form
-        # an authoritative summary, so report the contract status RUNNING with
-        # exit 2 (owner loss / no final trusted result), never an invented
-        # status such as INTERRUPTED.
+    if outcome.lease_lost or outcome.blocked:
+        # The DB Run stays RUNNING (for a resumer when the lease was lost, for
+        # human review when a node outcome is indeterminate) and this process
+        # cannot form an authoritative summary, so report the contract status
+        # RUNNING with exit 2, never an invented status such as INTERRUPTED.
+        reason = (
+            "lease lost; run left RUNNING for resume"
+            if outcome.lease_lost
+            else "node outcome indeterminate; run left RUNNING for review"
+        )
         if args.json:
             emit_json(
                 envelope("contract-01-envelope", {
@@ -336,14 +351,11 @@ def _report(args: argparse.Namespace, outcome: RunOutcome) -> None:
                     "ok": False,
                     "run_id": outcome.run_id,
                     "run_status": "RUNNING",
-                    "error": "lease lost; run left RUNNING for resume",
+                    "error": reason,
                 })
             )
         else:
-            print(
-                f"run {outcome.run_id}: RUNNING — lease lost; "
-                "run left RUNNING for resume"
-            )
+            print(f"run {outcome.run_id}: RUNNING — {reason}")
         return
     if args.json:
         emit_json(outcome.summary)
