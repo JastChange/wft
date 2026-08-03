@@ -173,6 +173,20 @@ def test_v200_unsupported_major_rejected() -> None:
     assert any("major" in p and "2" in p for p in problems)
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["FAILED", "UNKNOWN", "CANCELLED", "SKIPPED"],
+)
+def test_v200_unsupported_major_rejected_for_all_statuses(status: str) -> None:
+    # The major gate runs before the SUCCEEDED branch, so no status may bypass it.
+    payload = _payload(status=status, exit_code=0)
+    if status == "FAILED":
+        payload = _failed_payload()
+        payload["status"] = "FAILED"
+    problems = cv.validate_execution_result(_envelope_v("2.0.0", payload))
+    assert any("major" in p and "2" in p for p in problems), f"status={status} must reject major 2"
+
+
 def test_v110_declared_42_still_needs_declaration() -> None:
     # Version >= 1.1.0 makes 42 legal, but the script must still declare it.
     problems = cv.validate_execution_result(
