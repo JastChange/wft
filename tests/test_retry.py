@@ -35,8 +35,18 @@ def test_attempt_count_within_schema_bound() -> None:
 
 
 def test_transient_backoff_grows() -> None:
-    assert backoff_seconds("conn_timeout", 1) == 1.0
-    assert backoff_seconds("conn_timeout", 2) == 2.0
+    # 1s then 4s (no jitter) per the approved SSH retry plan.
+    assert backoff_seconds("conn_timeout", 1, jitter=False) == 1.0
+    assert backoff_seconds("conn_timeout", 2, jitter=False) == 4.0
+    assert backoff_seconds("conn_timeout", 3, jitter=False) == 4.0
+
+
+def test_transient_backoff_jitter_bounds() -> None:
+    # Jitter scales each base by [0.5, 1.5] so retries do not pile up in lockstep.
+    for retry in (1, 2, 3):
+        base = 1.0 if retry <= 1 else 4.0
+        value = backoff_seconds("conn_timeout", retry, jitter=True)
+        assert 0.5 * base <= value <= 1.5 * base
 
 
 def test_storage_backoff_is_short() -> None:

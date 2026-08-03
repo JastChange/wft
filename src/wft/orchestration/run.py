@@ -282,7 +282,9 @@ async def _execute_node(
     """Run one node with matrix-bounded retries.
 
     Returns ``(result_envelope, degraded, attempts)`` where ``attempts`` is the
-    per-attempt log for the ``attempts`` table (empty for a single clean run).
+    per-attempt log for the ``attempts`` table. The Contract-03 result spans the
+    whole logical execution (first attempt start -> final attempt finish), while
+    each attempt keeps its own ``started_at``/``finished_at``.
     """
     node_id = node["node_id"]
     execution_uid = new_uuid7()
@@ -290,6 +292,9 @@ async def _execute_node(
     exec_timeout_sec = limits["exec_timeout_sec"]
     attempt_count = 0
     attempts: list[dict] = []
+    loop = asyncio.get_running_loop()
+    logical_started_at = now_iso()
+    logical_start_loop = loop.time()
 
     while True:
         attempt_count += 1
@@ -318,6 +323,7 @@ async def _execute_node(
                 _attempt_record(attempt_count, status, final_error, attempt_started, attempt_finished)
             )
 
+        logical_finished_at = now_iso()
         result, degraded = build_execution_result(
             run_id=run_id,
             execution_uid=execution_uid,
@@ -325,9 +331,9 @@ async def _execute_node(
             script=script,
             status=status,
             attempt_count=attempt_count,
-            started_at=attempt_started,
-            finished_at=attempt_finished,
-            duration_ms=outcome.duration_ms,
+            started_at=logical_started_at,
+            finished_at=logical_finished_at,
+            duration_ms=int((loop.time() - logical_start_loop) * 1000),
             exit_code=outcome.exit_code,
             stdout_bytes=outcome.stdout,
             stderr_bytes=outcome.stderr,

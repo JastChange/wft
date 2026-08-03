@@ -386,7 +386,7 @@ def test_transient_error_retries_then_succeeds(tmp_path: Path, monkeypatch) -> N
 
     with store.database.connect_migrated() as conn:
         attempts = conn.execute(
-            "SELECT attempt_seq, status, error_class FROM attempts "
+            "SELECT attempt_seq, status, error_class, started_at FROM attempts "
             "ORDER BY attempt_seq"
         ).fetchall()
         assert [dict(a)["attempt_seq"] for a in attempts] == [1, 2]
@@ -395,10 +395,18 @@ def test_transient_error_retries_then_succeeds(tmp_path: Path, monkeypatch) -> N
             "SELECT status FROM executions WHERE run_id=?", (run_id,)
         ).fetchone()
         assert row["status"] == "SUCCEEDED"
-        flags = conn.execute(
-            "SELECT result_json FROM executions WHERE run_id=?", (run_id,)
-        ).fetchone()["result_json"]
-        assert "retried" in json.loads(flags)["payload"]["flags"]
+        payload = json.loads(
+            conn.execute(
+                "SELECT result_json FROM executions WHERE run_id=?", (run_id,)
+            ).fetchone()["result_json"]
+        )["payload"]
+        assert "retried" in payload["flags"]
+        # The Contract-03 result spans the whole logical execution (first
+        # attempt start -> final finish), not just the last attempt.
+        assert payload["attempt_count"] == 2
+        assert payload["started_at"] <= attempts[0]["started_at"]
+        assert payload["finished_at"] >= attempts[0]["started_at"]
+        assert payload["duration_ms"] >= 0
 
 
 # ------------------------------------------------------------------- CLI

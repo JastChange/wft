@@ -6,6 +6,8 @@ level. The Contract-03 schema caps ``attempt_count`` at 3.
 """
 from __future__ import annotations
 
+import random
+
 from wft.contracts.validate import ERROR_MATRIX
 
 NO_RETRY_BEFORE = {"PERMANENT", "SECURITY", "DATA"}
@@ -26,12 +28,16 @@ def should_retry(error_class: str, attempt_count: int) -> bool:
     return attempt_count < max_attempts(error_class)
 
 
-def backoff_seconds(error_class: str, retry_number: int) -> float:
-    """Short exponential backoff between retries (1s, 2s, 4s for TRANSIENT).
+def backoff_seconds(error_class: str, retry_number: int, *, jitter: bool = True) -> float:
+    """TRANSIENT retry backoff: 1s then 4s, each with +/-50% jitter.
 
-    Storage-layer retries (``db_busy``/``db_write_failed``) use a much shorter
-    fixed backoff; the SSH layer never sees those classes.
+    Storage-layer retries (``db_busy``/``db_write_failed``) keep a much shorter
+    fixed backoff; the SSH layer never sees those classes. ``jitter=False`` is
+    for deterministic tests.
     """
     if error_class in ("db_busy", "db_write_failed"):
         return 0.1 * retry_number
-    return float(2 ** (retry_number - 1))
+    base = 1.0 if retry_number <= 1 else 4.0
+    if not jitter:
+        return base
+    return base * random.uniform(0.5, 1.5)
