@@ -220,7 +220,13 @@ async def execute_run(
                 severity="warning" if status != "SUCCEEDED" else "info",
                 node_id=node_id,
                 execution_uid=payload["execution_uid"],
-                data={"status": status},
+                data={
+                    "status": status,
+                    # Blob/decode errors that could not fit the single Contract-03
+                    # error slot, persisted so per-node detail is auditable even if
+                    # the process dies before the batch summary is committed.
+                    "secondary_errors": [dict(e) for e in secondary_errors],
+                },
             ),
             attempts=attempts,
         )

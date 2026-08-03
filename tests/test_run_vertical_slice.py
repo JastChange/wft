@@ -24,6 +24,7 @@ from wft.execution.errors import error_dict
 from wft.execution.ssh import ExecutionOutcome
 from wft.idgen import new_run_id
 from wft.scriptreg.registry import Script
+from wft.storage.blobs import BlobStore
 from wft.storage.db import Database
 from wft.storage.store import Store
 
@@ -345,6 +346,76 @@ def test_binary_output_aggregates_decode_evidence(tmp_path: Path) -> None:
         assert row["status"] == "SUCCEEDED"
         assert json.loads(row["error_json"])["class"] == "output_decode_failed"
         assert json.loads(row["stdout_json"])["encoding"] == "binary"
+
+
+class _FailingBlob(BlobStore):
+    """A blob store whose writes always fail (错误矩阵_v0.1.md blob_write_failed)."""
+
+    def write(self, data: bytes) -> str:
+        raise OSError("disk full")
+
+
+def test_exec_nonzero_both_streams_blob_failure_persists_secondary(tmp_path: Path) -> None:
+    """exec_nonzero + stdout/stderr blob_write_failed: both streams survive.
+
+    The second stream's same-class error must not be dropped: the persisted
+    ``node_finished.data.secondary_errors`` carries both stdout and stderr blob
+    details, while the summary still counts ``blob_write_failed`` once per node
+    (per-node per-class-once aggregation).
+    """
+    script_body = (
+        "#!/bin/bash\n"
+        'python3 -c "import sys; '
+        "sys.stdout.write('o' * 300000); sys.stderr.write('e' * 100000)\"\n"
+        "exit 3\n"
+    )
+    script_path = tmp_path / "blob_fail.sh"
+    script_path.write_text(script_body, encoding="utf-8")
+    script = _script(script_path)
+
+    async def _main():
+        host_key, client_key, host_key_path, client_key_path, client_pub_path = _make_host_keys(tmp_path)
+        from ssh_test_server import RunningServer
+
+        async with RunningServer(host_key_path=host_key_path, authorized_keys=[client_pub_path]) as server:
+            known_hosts_path = tmp_path / "known_hosts"
+            _known_hosts(known_hosts_path, "127.0.0.1", server.port, host_key)
+            node = _node("127.0.0.1", server.port, key_path=client_key_path)
+            store = _make_store(tmp_path)
+            store.blobs = _FailingBlob(store.blobs.blob_dir)
+            spec = _make_run_spec(script, [node])
+            run_id, _ = create_run(store, spec, [node["node_id"]])
+            outcome = await execute_run(
+                store,
+                run_id=run_id,
+                run_spec=spec,
+                nodes=[node],
+                script=script,
+                known_hosts_path=known_hosts_path,
+            )
+            return store, run_id, outcome
+
+    store, run_id, outcome = asyncio.run(_main())
+    # exec_nonzero failure + blob fallback degradation: DEGRADED/failed, exit 1.
+    assert outcome.run_status == "DEGRADED"
+    assert outcome.batch_status == "failed"
+    assert outcome.exit_code == 1
+    # blob_write_failed is counted once per node despite failing on both streams.
+    assert outcome.error_counts == {"exec_nonzero": 1, "blob_write_failed": 1}
+
+    with store.database.connect_migrated() as conn:
+        row = conn.execute(
+            "SELECT data_json FROM run_events "
+            "WHERE run_id=? AND event_type='node_finished'",
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        data = json.loads(row["data_json"])
+        assert data["status"] == "FAILED"
+        blob_errs = [e for e in data["secondary_errors"] if e["class"] == "blob_write_failed"]
+        assert len(blob_errs) == 2
+        assert any("stdout" in e["message"] for e in blob_errs)
+        assert any("stderr" in e["message"] for e in blob_errs)
 
 
 def test_transient_error_retries_then_succeeds(tmp_path: Path, monkeypatch) -> None:

@@ -227,8 +227,10 @@ def build_execution_result(
     when either stream held non-UTF-8 bytes or a blob write fell back. Secondary
     blob/decode errors that cannot fit the single Contract-03 ``error`` slot
     (e.g. beside an ``exec_nonzero`` primary) are returned so the caller can
-    keep them in aggregate evidence instead of dropping them. Raises
-    :class:`WFTContractError` if the built envelope fails Contract-03 validation.
+    keep them in aggregate evidence instead of dropping them. Same-class errors
+    from different streams all survive (identity-based, not class-filtered) so
+    per-stream detail is never lost. Raises :class:`WFTContractError` if the
+    built envelope fails Contract-03 validation.
     """
     stdout_stream, stdout_flags, stdout_degraded, stdout_err = build_stream(
         "stdout",
@@ -256,7 +258,7 @@ def build_execution_result(
         or (stdout_stream is not None and stdout_stream.get("encoding") == "binary")
         or (stderr_stream is not None and stderr_stream.get("encoding") == "binary")
     )
-    stream_err = stdout_err or stderr_err
+    stream_errors = [e for e in (stdout_err, stderr_err) if e is not None]
     decode_err = (
         error_dict(
             "output_decode_failed", "script output is not valid UTF-8 (binary content)"
@@ -271,7 +273,7 @@ def build_execution_result(
         status = "FAILED"
         degraded = True
         if error is None:
-            error = stream_err
+            error = stream_errors[0] if stream_errors else decode_err
         if stdout_stream is None:
             stdout_stream = _inline_empty()
         if stderr_stream is None:
@@ -280,13 +282,16 @@ def build_execution_result(
         # No caller-supplied primary error: promote the strongest stream-level
         # evidence (blob_write_failed before output_decode_failed) so batch
         # aggregation counts the real class.
-        error = stream_err or decode_err
+        error = (stream_errors[0] if stream_errors else None) or decode_err
 
+    # Every stream-level and decode error that is not the primary error itself
+    # survives as structured evidence. The filter is identity-based, not
+    # class-based: when both stdout and stderr failed a blob write they share
+    # blob_write_failed yet each stream's message must be preserved.
     secondary: list[dict] = []
-    if error is not None:
-        for extra in (stream_err, decode_err):
-            if extra is not None and extra["class"] != error["class"]:
-                secondary.append(extra)
+    for extra in [*stream_errors, decode_err]:
+        if extra is not None and extra is not error:
+            secondary.append(extra)
 
     payload: dict = {
         "execution_uid": execution_uid,
