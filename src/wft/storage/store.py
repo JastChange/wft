@@ -411,10 +411,14 @@ class Store:
         is CAS-updated to mirror this attempt: a START write bumps it
         monotonically (``attempt_count < seq``, raising
         :class:`WFTLeaseLostError` when the checkpoint is not RUNNING with this
-        ``execution_uid``), an END write is idempotent (``attempt_count <=
-        seq``, never decreases). So the checkpoint count is always the highest
-        persisted attempt_seq -- a resumed node's cumulative count -- and never
-        a per-process reset.
+        ``execution_uid``). An END write applies the same strong CAS (matching
+        run/node/RUNNING/execution_uid) and sets
+        ``attempt_count=MAX(attempt_count, seq)`` so it never decreases; a
+        checkpoint that is not hit raises :class:`WFTLeaseLostError`, which
+        rolls the attempt upsert back too -- a final attempt can never land
+        without its checkpoint CAS. So the checkpoint count is always the
+        highest persisted attempt_seq -- a resumed node's cumulative count --
+        and never a per-process reset.
         """
         now = now_iso()
         with self.transaction() as conn:
@@ -451,12 +455,23 @@ class Store:
                         f"attempt {attempt_seq}"
                     )
             else:
-                conn.execute(
-                    "UPDATE node_tasks SET attempt_count=?, updated_at=? "
+                # Strong END CAS: match run/node/RUNNING/execution_uid and never
+                # lower the count. A miss means the final attempt cannot be tied
+                # to its checkpoint -- raise so the attempt upsert above rolls
+                # back and the row stays RUNNING.
+                cur = conn.execute(
+                    "UPDATE node_tasks SET attempt_count=MAX(attempt_count, ?), "
+                    "updated_at=? "
                     "WHERE run_id=? AND node_id=? AND status='RUNNING' "
-                    "AND execution_uid=? AND attempt_count <= ?",
-                    (attempt_seq, now, run_id, node_id, execution_uid, attempt_seq),
+                    "AND execution_uid=?",
+                    (attempt_seq, now, run_id, node_id, execution_uid),
                 )
+                if cur.rowcount != 1:
+                    raise WFTLeaseLostError(
+                        f"run {run_id}: node {node_id} checkpoint is not RUNNING "
+                        f"with execution_uid {execution_uid}; refusing to "
+                        f"finalize attempt {attempt_seq}"
+                    )
 
     def get_attempt_max_seq(self, execution_uid: str) -> int:
         """Return the highest persisted ``attempt_seq`` for an execution (0 when none)."""

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from wft.contracts.errors import WFTLeaseLostError
 from wft.execution.errors import error_dict
 from wft.execution.ssh import ExecutionOutcome
 from wft.idgen import new_run_id, new_uuid7
@@ -590,3 +591,87 @@ def test_resume_zero_dispatch_finalizes_all_terminal(tmp_path: Path, monkeypatch
         summary = json.loads(row["summary_json"])
         assert summary["counts"]["succeeded"] == 1
         assert summary["counts"]["failed"] == 1
+
+
+# ------------------------------------------- record_attempt END CAS (blk 4)
+
+
+def test_record_attempt_end_rejected_when_checkpoint_not_owned(
+    tmp_path: Path,
+) -> None:
+    """A final attempt can never land without its checkpoint CAS: an END whose
+    node_id/execution_uid does not match the RUNNING checkpoint raises, rolling
+    the attempt upsert back so the row stays RUNNING and the count is untouched."""
+    script = _script(_scratch(tmp_path))
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id = _start_owned_run(store, spec, ["node-a"])
+    uid = new_uuid7()
+    assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
+                               lease_owner="owner-1")
+
+    attempt_id = new_uuid7()
+    started = now_iso()
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=attempt_id, attempt_seq=1, status="RUNNING",
+        started_at=started, lease_owner="owner-1",
+    )
+    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 1
+
+    error = error_dict("conn_timeout", "attempt 1 failed")
+    with pytest.raises(WFTLeaseLostError):
+        store.record_attempt(
+            run_id, "node-OTHER", uid,  # wrong node_id: no checkpoint to CAS
+            attempt_id=attempt_id, attempt_seq=1, status="FAILED",
+            started_at=started, finished_at=now_iso(),
+            error=error, lease_owner="owner-1",
+        )
+    with pytest.raises(WFTLeaseLostError):
+        store.record_attempt(
+            run_id, "node-a", new_uuid7(),  # wrong execution_uid
+            attempt_id=attempt_id, attempt_seq=1, status="FAILED",
+            started_at=started, finished_at=now_iso(),
+            error=error, lease_owner="owner-1",
+        )
+
+    # The rejected ENDs rolled back: the attempt row is still RUNNING, and the
+    # checkpoint is exactly as the START left it.
+    last = store.get_last_attempt(uid)
+    assert last is not None and last["status"] == "RUNNING"
+    assert last["finished_at"] is None
+    cp = store.get_node_task(run_id, "node-a")
+    assert cp["status"] == "RUNNING"
+    assert cp["execution_uid"] == uid
+    assert cp["attempt_count"] == 1
+    assert store.get_node_task(run_id, "node-OTHER") is None
+
+
+def test_record_attempt_end_lower_seq_never_decreases_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """An out-of-order END with a smaller attempt_seq must not lower the
+    checkpoint count: ``attempt_count=MAX(attempt_count, seq)`` keeps it at the
+    highest persisted attempt."""
+    script = _script(_scratch(tmp_path))
+    store = _make_store(tmp_path)
+    spec = _make_run_spec(script)
+    run_id = _start_owned_run(store, spec, ["node-a"])
+    uid = new_uuid7()
+    assert store.set_node_task(run_id, "node-a", "RUNNING", execution_uid=uid,
+                               lease_owner="owner-1")
+
+    _record_attempts(store, run_id, "node-a", uid,
+                     finals=[(1, "conn_timeout"), (2, "conn_timeout"),
+                             (3, "conn_timeout")])
+    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 3
+
+    # A replayed/out-of-order final write for seq 2 keeps the count at 3.
+    store.record_attempt(
+        run_id, "node-a", uid,
+        attempt_id=new_uuid7(), attempt_seq=2, status="FAILED",
+        started_at=now_iso(), finished_at=now_iso(),
+        error=error_dict("conn_timeout", "replayed attempt 2"),
+        lease_owner="owner-1",
+    )
+    assert store.get_node_task(run_id, "node-a")["attempt_count"] == 3
