@@ -605,3 +605,60 @@ def test_blob_write_atomic_no_partial_on_failure(tmp_path: Path) -> None:
     # No temp files left behind.
     assert not list(tmp_path.rglob(".blob.*"))
     assert dest.is_file()
+
+
+def test_blob_lookups_reject_path_escape(tmp_path: Path) -> None:
+    blob = BlobStore(tmp_path / "blobs")
+    for bad in ("../secret", "..%2Fsecret", "abc", "A" * 64,
+                "0" * 63, "0" * 65, "deadbeef/../../x"):
+        with pytest.raises(ValueError):
+            blob.read(bad)
+        with pytest.raises(ValueError):
+            blob.contains(bad)
+
+
+def test_blob_list_excludes_temps_and_junk(tmp_path: Path) -> None:
+    blob = BlobStore(tmp_path / "blobs")
+    blob.write(b"a")
+    blob.write(b"b")
+    (tmp_path / "blobs" / ".blob.leftover").write_bytes(b"partial")
+    (tmp_path / "blobs" / "not-a-blob").write_bytes(b"junk")
+    names = blob.list()
+    assert len(names) == 2
+    assert all(len(n) == 64 for n in names)
+
+
+def _blob_result(run_id: str, node_id: str, execution_uid: str, blob_ref: str, size: int) -> dict:
+    res = _result(run_id, node_id, execution_uid)
+    res["payload"]["stdout"] = {
+        "blob_ref": blob_ref,
+        "bytes": size,
+        "truncated": False,
+        "sha256": blob_ref,
+        "encoding": "utf-8",
+    }
+    return res
+
+
+def test_find_orphan_blobs_identifies_unreferenced(tmp_path: Path) -> None:
+    """A blob written before a DB commit that then lands is referenced; one that
+    never gets committed (crash after blob write, before commit) stays
+    identifiable as an orphan."""
+    store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
+    rid = "01HX0" + "A" * 21
+    uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    kept = store.blobs.write(b"x" * (300 * 1024))
+    orphan = store.blobs.write(b"y" * 1000)  # never referenced by a commit
+    store.commit_execution_result(
+        rid,
+        "node-a",
+        result=_blob_result(rid, "node-a", uid, kept, 300 * 1024),
+        checkpoint_status="SUCCEEDED",
+        outbox_event=_outbox_event("execution_result", uid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+        node_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad", event_type="node_finished"),
+    )
+    # The committed blob is complete on disk and not an orphan.
+    assert store.blobs.read(kept) == b"x" * (300 * 1024)
+    assert store.find_orphan_blobs() == [orphan]

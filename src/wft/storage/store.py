@@ -474,6 +474,26 @@ class Store:
         validate_contract("contract-06-persist-ack", envelope)
         return envelope
 
+    def find_orphan_blobs(self) -> list[str]:
+        """Return blob names stored on disk that no execution references.
+
+        A blob write lands before the DB commit (so a commit never references an
+        incomplete blob); if that DB commit then fails, the blob legitimately
+        remains but is orphaned. This scan makes such orphans identifiable by
+        comparing the on-disk blob set against every ``blob_ref`` in the
+        executions table.
+        """
+        referenced: set[str] = set()
+        with self.transaction() as conn:
+            rows = conn.execute("SELECT stdout_json, stderr_json FROM executions").fetchall()
+        for row in rows:
+            for col in ("stdout_json", "stderr_json"):
+                stream = json.loads(row[col])
+                ref = stream.get("blob_ref")
+                if ref is not None:
+                    referenced.add(ref)
+        return [sha for sha in self.blobs.list() if sha not in referenced]
+
     def get_batch_summary(self, run_id: str) -> dict | None:
         """Return the stored Contract-05 payload for a Run, or None."""
         with self.transaction() as conn:
