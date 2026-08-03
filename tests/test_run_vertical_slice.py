@@ -954,17 +954,24 @@ def test_cli_run_resume_after_kill9_recovers_stale_run(tmp_path: Path) -> None:
                     tasks = {
                         dict(r)["node_id"]: dict(r)
                         for r in conn.execute(
-                            "SELECT node_id, status, execution_uid FROM node_tasks "
-                            "WHERE run_id=?", (run_id,)
+                            "SELECT node_id, status, execution_uid, attempt_count "
+                            "FROM node_tasks WHERE run_id=?", (run_id,)
                         ).fetchall()
                     }
+                    # node-a must have STARTed its first SSH attempt (attempt_count
+                    # bumped to 1) so the checkpoint count is meaningful pre-crash.
                     if (tasks.get("node-b", {}).get("status") == "FAILED"
-                            and tasks.get("node-a", {}).get("status") == "RUNNING"):
+                            and tasks.get("node-a", {}).get("status") == "RUNNING"
+                            and tasks.get("node-a", {}).get("attempt_count") == 1):
                         uid_a_before = tasks["node-a"]["execution_uid"]
                         uid_b = tasks["node-b"]["execution_uid"]
+                        attempt_count_a_before = tasks["node-a"]["attempt_count"]
                         break
             time.sleep(0.1)
         assert run_id is not None and uid_a_before and uid_b, "run never reached mid-crash state"
+        # Before the crash, node-a's checkpoint count is exactly its single
+        # STARTed SSH attempt; the checkpoint uid matches the attempt row's.
+        assert attempt_count_a_before == 1
         # Hard-terminate the owner process (kill -9); its run is left RUNNING.
         proc.kill()
         proc.wait(timeout=10)
@@ -1001,6 +1008,7 @@ def test_cli_run_resume_after_kill9_recovers_stale_run(tmp_path: Path) -> None:
             assert set(execs) == {"node-a", "node-b"}
             assert execs["node-a"]["execution_uid"] == uid_a_before
             assert execs["node-a"]["status"] == "SUCCEEDED"
+            assert execs["node-a"]["attempt_count"] == 2  # cumulative across crash
             assert execs["node-b"]["execution_uid"] == uid_b  # committed node unchanged
             assert execs["node-b"]["status"] == "FAILED"
             attempt_seqs: dict[str, list[int]] = {}
@@ -1023,6 +1031,10 @@ def test_cli_run_resume_after_kill9_recovers_stale_run(tmp_path: Path) -> None:
         # The leftover node-a RUNNING attempt (seq 1, crash) plus the resumed
         # final attempt (seq 2): attempt_count is cumulative across the crash.
         assert attempt_seqs[uid_a_before] == [1, 2]
+        # The node_tasks checkpoint count mirrors the highest persisted
+        # attempt_seq (record_attempt CAS), consistent with the executions rows.
+        assert store.get_node_task(run_id, "node-a")["attempt_count"] == 2
+        assert store.get_node_task(run_id, "node-b")["attempt_count"] == 1
         # Audit chain: created/started, first node starts, node-b finished,
         # the resume marks node-a UNKNOWN, node-a re-runs and finishes, done.
         for expected in ("run_created", "run_started", "node_started",

@@ -406,7 +406,17 @@ class Store:
         is ever duplicated. ``lease_owner`` fences the write: an owner who lost
         the lease (a resumer took it) raises :class:`WFTLeaseLostError` instead
         of corrupting the resumer's attempt sequence.
+
+        In the SAME fenced transaction the node checkpoint's ``attempt_count``
+        is CAS-updated to mirror this attempt: a START write bumps it
+        monotonically (``attempt_count < seq``, raising
+        :class:`WFTLeaseLostError` when the checkpoint is not RUNNING with this
+        ``execution_uid``), an END write is idempotent (``attempt_count <=
+        seq``, never decreases). So the checkpoint count is always the highest
+        persisted attempt_seq -- a resumed node's cumulative count -- and never
+        a per-process reset.
         """
+        now = now_iso()
         with self.transaction() as conn:
             self._assert_lease_owner(conn, run_id, lease_owner)
             conn.execute(
@@ -427,6 +437,26 @@ class Store:
                     started_at, finished_at,
                 ),
             )
+            if status == "RUNNING":
+                cur = conn.execute(
+                    "UPDATE node_tasks SET attempt_count=?, updated_at=? "
+                    "WHERE run_id=? AND node_id=? AND status='RUNNING' "
+                    "AND execution_uid=? AND attempt_count < ?",
+                    (attempt_seq, now, run_id, node_id, execution_uid, attempt_seq),
+                )
+                if cur.rowcount != 1:
+                    raise WFTLeaseLostError(
+                        f"run {run_id}: node {node_id} checkpoint is not RUNNING "
+                        f"with execution_uid {execution_uid}; refusing to record "
+                        f"attempt {attempt_seq}"
+                    )
+            else:
+                conn.execute(
+                    "UPDATE node_tasks SET attempt_count=?, updated_at=? "
+                    "WHERE run_id=? AND node_id=? AND status='RUNNING' "
+                    "AND execution_uid=? AND attempt_count <= ?",
+                    (attempt_seq, now, run_id, node_id, execution_uid, attempt_seq),
+                )
 
     def get_attempt_max_seq(self, execution_uid: str) -> int:
         """Return the highest persisted ``attempt_seq`` for an execution (0 when none)."""
