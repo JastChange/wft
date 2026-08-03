@@ -15,18 +15,23 @@ CONNECT_RATE_PER_SEC_DEFAULT = 20
 
 
 class RateLimiter:
-    """Minimal per-second rate limiter for connection attempts."""
+    """Minimal per-second rate limiter for connection attempts.
+
+    The first call returns immediately; each later call waits until its
+    scheduled slot, spacing starts at least ``1 / rate_per_sec`` apart.
+    """
 
     def __init__(self, rate_per_sec: float) -> None:
         if rate_per_sec <= 0:
             raise ValueError("rate_per_sec must be positive")
         self._interval = 1.0 / rate_per_sec
-        self._next_at = 0.0
+        self._next_at = -float("inf")
 
     async def wait(self) -> None:
         now = asyncio.get_running_loop().time()
-        self._next_at = max(now, self._next_at) + self._interval
-        delay = self._next_at - now
+        start = max(now, self._next_at)
+        self._next_at = start + self._interval
+        delay = start - now
         if delay > 0:
             await asyncio.sleep(delay)
 
