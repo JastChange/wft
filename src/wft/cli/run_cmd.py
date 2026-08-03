@@ -195,8 +195,20 @@ def _resume(args: argparse.Namespace) -> int:
             "lease window and the lease must have expired); a live owner holds it"
         )
 
-    run_spec = json.loads(run["run_spec_json"])
-    payload = run_spec["payload"]
+    # The store persists the Contract-02 payload (create_run stores the payload,
+    # not the meta envelope); wrap it back so execute_run sees run_spec["payload"].
+    payload = json.loads(run["run_spec_json"])
+    run_spec = {
+        "meta": {
+            "schema_name": "contract-02-runspec",
+            "schema_version": "1.0.0",
+            "producer": "wft.orchestration",
+            "created_at": payload["trigger"]["requested_at"],
+            "run_id": run_id,
+            "stage": "trigger",
+        },
+        "payload": payload,
+    }
     script_name = payload["script"]["name"]
     script_sha = payload["script"]["sha256"]
     if len(script_sha) != 64 or any(c not in "0123456789abcdef" for c in script_sha):
