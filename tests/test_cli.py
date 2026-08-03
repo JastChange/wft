@@ -195,3 +195,47 @@ def test_hostkey_onboard_config_error_is_two(monkeypatch, tmp_path) -> None:
         "hostkey", "onboard", "--inventory", str(tmp_path / "missing.yaml"),
     ])
     assert hostkey_cmd.handle_onboard(args) == EXIT_CONFIG
+
+
+def test_hostkey_onboard_json_success_emits_contract01(monkeypatch, tmp_path, capsys) -> None:
+    """--json success: stdout is a pure, valid Contract-01 envelope (exit 0)."""
+    from wft.cli import hostkey_cmd
+    from wft.security.hostkey import DiscoveredKey
+
+    key = DiscoveredKey(node_id="node-a", host="10.0.0.11", port=22, algorithm="ssh-ed25519", key_blob="AAAABLOB")
+
+    def fake_discover(host, port, node_id, *, timeout_sec=5.0):
+        return [key]
+
+    monkeypatch.setattr(hostkey_cmd.hostkey, "discover", fake_discover)
+    args = build_parser().parse_args([
+        "hostkey", "onboard", "--inventory", str(INVENTORY_EXAMPLE), "--node", "node-a",
+        "--accept", f"node-a:ssh-ed25519:{key.fingerprint}",
+        "--known-hosts", str(tmp_path / "known_hosts"), "--json",
+    ])
+    assert hostkey_cmd.handle_onboard(args) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    _assert_contract01_valid(payload)
+    assert payload["payload"]["confirmed"] == ["node-a"]
+    assert payload["payload"]["rejected"] == []
+    assert payload["payload"]["written"] == ["10.0.0.11 ssh-ed25519 AAAABLOB"]
+
+
+def test_hostkey_onboard_json_failure_emits_contract01(monkeypatch, tmp_path, capsys) -> None:
+    """--json with a discovery failure: still a valid Contract-01 envelope (exit 1)."""
+    from wft.cli import hostkey_cmd
+    from wft.contracts.errors import WFTError
+
+    def fake_discover(host, port, node_id, *, timeout_sec=5.0):
+        raise WFTError("connection refused")
+
+    monkeypatch.setattr(hostkey_cmd.hostkey, "discover", fake_discover)
+    args = build_parser().parse_args([
+        "hostkey", "onboard", "--inventory", str(INVENTORY_EXAMPLE), "--node", "node-a",
+        "--known-hosts", str(tmp_path / "known_hosts"), "--json",
+    ])
+    assert hostkey_cmd.handle_onboard(args) == EXIT_BUSINESS
+    payload = json.loads(capsys.readouterr().out)
+    _assert_contract01_valid(payload)
+    assert payload["payload"]["confirmed"] == []
+    assert payload["payload"]["rejected"] == [{"node_id": "node-a", "reason": "connection refused"}]

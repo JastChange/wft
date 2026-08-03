@@ -88,7 +88,10 @@ def handle_onboard(args: argparse.Namespace) -> int:
             continue
 
         for key in keys:
-            print(key.display())
+            if args.json:
+                print(key.display(), file=sys.stderr)
+            else:
+                print(key.display())
             confirmed = _decide(key, pre_reviewed)
             if confirmed:
                 accepted.append(key)
