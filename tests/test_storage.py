@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from wft.contracts.errors import WFTIdempotencyConflict
+from wft.contracts.errors import WFTIdempotencyConflict, WFTStorageError
 from wft.storage.blobs import BlobStore
 from wft.storage.db import Database
 from wft.storage.schema import SCHEMA_VERSION, migrate
@@ -383,6 +383,9 @@ def test_commit_execution_result_replay_returns_original(store: Store) -> None:
     )
     first = store.commit_execution_result(**args)
     replay = store.commit_execution_result(**args)
+    # Byte-identical Contract-06 envelope: committed_at comes from the stored
+    # executions.created_at, so the replay is exactly the original ack.
+    assert replay == first
     assert replay["payload"]["object_id"] == first["payload"]["object_id"]
     assert replay["payload"]["outbox_event_ids"] == ["0190a2b3-c4d5-46e7-8890-1234567890ac"]
     conn = store.database.connect()
@@ -428,6 +431,9 @@ def test_finalize_run_terminal_replay_returns_ack(store: Store) -> None:
     )
     first = store.finalize_run(**args)
     replay = store.finalize_run(**args)
+    # Byte-identical Contract-06 envelope: committed_at comes from the stored
+    # batch_summaries.created_at.
+    assert replay == first
     assert replay["payload"]["object_id"] == first["payload"]["object_id"]
     assert store.get_run(rid)["status"] == "SUCCESS"
     conn = store.database.connect()
@@ -463,10 +469,47 @@ def test_set_node_task_forbids_terminal_rewrite(store: Store) -> None:
     store.create_run(_run_spec(rid))
     store.insert_node_tasks(rid, ["node-a"])
     assert store.set_node_task(rid, "node-a", "RUNNING") is True
-    assert store.set_node_task(rid, "node-a", "SUCCEEDED") is True
-    # Terminal node task cannot be rewritten.
+    assert store.set_node_task(rid, "node-a", "SUCCEEDED", execution_uid="u1") is True
+    # Terminal node task cannot be rewritten, not even to the same status
+    # with a different execution_uid.
     assert store.set_node_task(rid, "node-a", "FAILED") is False
+    assert store.set_node_task(rid, "node-a", "SUCCEEDED", execution_uid="u2") is False
     assert store.get_node_task(rid, "node-a")["status"] == "SUCCEEDED"
+    assert store.get_node_task(rid, "node-a")["execution_uid"] == "u1"
+
+
+def test_commit_execution_result_terminal_node_rolls_back(store: Store) -> None:
+    """A terminal node cannot acquire a new execution; the whole commit rolls back."""
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    args = dict(
+        run_id=rid,
+        node_id="node-a",
+        result=_result(rid, "node-a", uid, status="SUCCEEDED"),
+        checkpoint_status="SUCCEEDED",
+        outbox_event=_outbox_event("execution_result", uid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+        node_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad", event_type="node_finished"),
+    )
+    store.commit_execution_result(**args)
+    # A second execution on the same terminal node is not a replay (different
+    # execution_uid) and must roll back everything, not append new rows.
+    uid2 = "0190a2b3-c4d5-46e7-8890-1234567890bb"
+    with pytest.raises(WFTStorageError):
+        store.commit_execution_result(
+            rid,
+            "node-a",
+            result=_result(rid, "node-a", uid2, status="SUCCEEDED"),
+            checkpoint_status="SUCCEEDED",
+            outbox_event=_outbox_event("execution_result", uid2, "0190a2b3-c4d5-46e7-8890-1234567890bc"),
+            node_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890bd", event_type="node_finished"),
+        )
+    conn = store.database.connect()
+    assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 1
+    conn.close()
 
 
 # ------------------------------------------------------------------- blobs

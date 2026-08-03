@@ -116,9 +116,12 @@ async def execute_run(
     nodes: list[dict],
     script: Script,
     known_hosts_path,
-    lease_owner: str = "cli",
+    lease_owner: str | None = None,
 ) -> RunOutcome:
     """Run ``script`` on ``nodes`` and finalize with a Contract-05 summary."""
+    # The lease owner must be unguessable per execution so a separate CLI
+    # process cannot renew/resume this run's heartbeat with a shared "cli" tag.
+    lease_owner = lease_owner or new_uuid7()
     limits = run_spec["payload"]["limits"]
     started_at = now_iso()
     loop = asyncio.get_running_loop()
@@ -348,22 +351,20 @@ def _attempt_record(
 def _batch_status(degraded: bool, any_succeeded: bool, any_failed: bool) -> tuple[str, str]:
     """Map trustworthy node outcomes to (run_status, batch_status) per 命令契约 §7.
 
-    ``run_status`` records whether the batch completed with trustworthy results.
-    Node-level FAILED outcomes (script non-zero, retries exhausted) are still
-    trustworthy, so an all-failed batch is ``SUCCESS``/``failed`` and a mixed
-    one is ``SUCCESS``/``partial``. Non-critical degradation (binary output,
-    etc.) is ``DEGRADED``. ``FAILED``/exit 2 is reserved for a batch with no
-    trustworthy result at all.
+    ``batch_status`` aggregates node outcomes independently: success+failed is
+    ``partial``, only failed is ``failed``, otherwise ``success``. ``run_status``
+    then records whether the batch ran with trustworthy results: non-critical
+    degradation (binary output, etc.) is ``DEGRADED``, otherwise ``SUCCESS``.
+    ``FAILED``/exit 2 is reserved for a batch with no trustworthy result at all,
+    which this function never produces from node outcomes.
     """
-    if degraded and any_failed:
-        return "DEGRADED", "partial"
-    if degraded:
-        return "DEGRADED", "success"
-    if any_failed and any_succeeded:
-        return "SUCCESS", "partial"
-    if any_failed:
-        return "SUCCESS", "failed"
-    return "SUCCESS", "success"
+    if any_succeeded and any_failed:
+        batch_status = "partial"
+    elif any_failed:
+        batch_status = "failed"
+    else:
+        batch_status = "success"
+    return ("DEGRADED" if degraded else "SUCCESS"), batch_status
 
 
 def _run_exit_code(run_status: str, batch_status: str) -> int:

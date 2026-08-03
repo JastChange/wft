@@ -233,12 +233,14 @@ class Store:
                     (status, execution_uid, now, now, run_id, node_id),
                 )
             else:
+                # A terminal status may only be set from a writable
+                # (PENDING/RUNNING) task; a finished node can never be re-flagged,
+                # even to the same status with a different execution_uid.
                 cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
                     "finished_at=COALESCE(finished_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=? "
-                    "AND (status IN ('PENDING','RUNNING') OR status=?)",
-                    (status, execution_uid, error_class, now, now, run_id, node_id, status),
+                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')",
+                    (status, execution_uid, error_class, now, now, run_id, node_id),
                 )
             return cur.rowcount == 1
 
@@ -270,12 +272,13 @@ class Store:
         ack_event_ids: list[str] = []
         with self.transaction() as conn:
             existing = conn.execute(
-                "SELECT result_json FROM executions WHERE execution_uid=?",
+                "SELECT result_json, created_at FROM executions WHERE execution_uid=?",
                 (execution_uid,),
             ).fetchone()
             if existing is not None:
-                # AC-011 replay: identical content returns the original ack;
-                # different content is a conflict, never an overwrite.
+                # AC-011 replay: identical content returns the original ack
+                # (reusing the original committed_at so the envelope is
+                # byte-identical); different content is a conflict.
                 if existing["result_json"] != _j(result):
                     raise WFTIdempotencyConflict(
                         f"execution_uid {execution_uid} already persisted "
@@ -285,7 +288,8 @@ class Store:
                     conn, "execution_result", execution_uid
                 )
                 return self._persist_ack(
-                    "execution_result", execution_uid, now, ack_event_ids
+                    "execution_result", execution_uid,
+                    existing["created_at"], ack_event_ids,
                 )
             conn.execute(
                 "INSERT INTO executions "
@@ -335,16 +339,24 @@ class Store:
                 )
                 ack_event_ids.append(outbox_event["event_id"])
             self._insert_event(conn, run_id, node_event)
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
                 "finished_at=?, updated_at=? WHERE run_id=? AND node_id=? "
-                "AND (status IN ('PENDING','RUNNING') OR status=?)",
+                "AND status IN ('PENDING','RUNNING')",
                 (
                     checkpoint_status, execution_uid,
                     (payload.get("error") or {}).get("class"),
-                    now, now, run_id, node_id, checkpoint_status,
+                    now, now, run_id, node_id,
                 ),
             )
+            if cur.rowcount != 1:
+                # A terminal node task may not acquire a new execution; raising
+                # inside the transaction rolls back the whole commit (AC-011).
+                raise WFTStorageError(
+                    f"node {node_id}: cannot commit execution_result "
+                    f"{execution_uid} — node task is not in a writable "
+                    "(PENDING/RUNNING) state"
+                )
         return self._persist_ack("execution_result", execution_uid, now, ack_event_ids)
 
     def insert_run_event(self, run_id: str, event: dict) -> dict:
@@ -381,9 +393,11 @@ class Store:
             )
             if cur.rowcount != 1:
                 # Already terminal: nothing may be rewritten. A replay must
-                # reproduce the stored summary; different content is a conflict.
+                # reproduce the stored summary (with the original committed_at)
+                # or it is a conflict.
                 existing = conn.execute(
-                    "SELECT summary_json FROM batch_summaries WHERE run_id=?",
+                    "SELECT summary_json, created_at FROM batch_summaries "
+                    "WHERE run_id=?",
                     (run_id,),
                 ).fetchone()
                 if existing is None:
@@ -396,7 +410,10 @@ class Store:
                         "cannot finalize with a different summary"
                     )
                 ack_event_ids = self._outbox_event_ids(conn, "batch_summary", run_id)
-                return self._persist_ack("batch_summary", run_id, now, ack_event_ids)
+                return self._persist_ack(
+                    "batch_summary", run_id,
+                    existing["created_at"], ack_event_ids,
+                )
             conn.execute(
                 "INSERT INTO batch_summaries "
                 "(run_id, summary_revision, summary_json, final, created_at) "

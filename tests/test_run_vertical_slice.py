@@ -178,6 +178,10 @@ def test_batch_status_mapping_follows_contract() -> None:
     assert _run_exit_code("DEGRADED", "success") == 1
     # Degradation combined with node failures -> DEGRADED/partial.
     assert _batch_status(degraded=True, any_succeeded=True, any_failed=True) == ("DEGRADED", "partial")
+    # Degradation with no succeeded nodes -> DEGRADED/failed (batch is the
+    # node aggregate; run_status only reflects trustworthiness).
+    assert _batch_status(degraded=True, any_succeeded=False, any_failed=True) == ("DEGRADED", "failed")
+    assert _run_exit_code("DEGRADED", "failed") == 1
     # No trustworthy result -> FAILED, exit 2.
     assert _run_exit_code("FAILED", "failed") == 2
 
