@@ -117,6 +117,43 @@ def validate_contract_all(key: str, instance: object) -> list[str]:
     return problems
 
 
+def _parse_version(v: object) -> tuple[int, int] | None:
+    """Parse ``major.minor`` from a ``schema_version`` like ``1.1.0``."""
+    if not isinstance(v, str):
+        return None
+    parts = v.split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
+    return major, minor
+
+
+def _exit_code_version_problem(schema_version: object, exit_code: int) -> str | None:
+    """Bind the SUCCEEDED exit-code rule to the declared schema version.
+
+    Non-zero success codes only exist since Contract-03 1.1.0: a 1.0.x producer
+    may only emit ``exit_code=0``, and an unsupported major version is rejected
+    outright. Higher compatible MINORs (e.g. 1.2.0) keep the 1.1.0 behaviour.
+    """
+    parsed = _parse_version(schema_version)
+    if parsed is None:
+        return f"schema_version={schema_version!r} is not a supported 1.x version"
+    major, minor = parsed
+    if major != 1:
+        return (
+            f"schema_version={schema_version!r} has unsupported major version "
+            f"{major}; only 1.x is supported"
+        )
+    if exit_code != 0 and minor < 1:
+        return (
+            f"schema_version={schema_version!r} only permits SUCCEEDED exit_code=0; "
+            "non-zero success codes require schema_version >= 1.1.0"
+        )
+    return None
+
+
 def validate_execution_result(
     instance: object,
     *,
@@ -125,17 +162,30 @@ def validate_execution_result(
     """Validate a Contract-03 result, including the cross-contract exit-code rule.
 
     Contract-03 1.1.0 accepts any integer success code at the schema level; the
-    script registry (Contract-12) declares which codes count as success. A
-    ``SUCCEEDED`` result whose ``exit_code`` is not among the resolved script's
+    script registry (Contract-12) declares which codes count as success, and the
+    declared ``meta.schema_version`` decides whether a non-zero code is legal at
+    all (1.0.x only permits 0; unsupported majors are rejected). A ``SUCCEEDED``
+    result whose ``exit_code`` is not among the resolved script's
     ``expected_exit_codes`` is a semantic violation.
     """
     problems = validate_contract_all("contract-03-execution-result", instance)
-    payload = instance.get("payload") if isinstance(instance, dict) else None
-    if isinstance(payload, dict) and payload.get("status") == "SUCCEEDED":
-        exit_code = payload.get("exit_code")
-        if exit_code not in expected_exit_codes:
-            problems.append(
-                f"SUCCEEDED exit_code={exit_code!r} not in expected_exit_codes "
-                f"{sorted(expected_exit_codes)} of the resolved script"
-            )
+    if not isinstance(instance, dict):
+        return problems
+    payload = instance.get("payload")
+    if not isinstance(payload, dict) or payload.get("status") != "SUCCEEDED":
+        return problems
+    exit_code = payload.get("exit_code")
+    if not isinstance(exit_code, int):
+        return problems  # the schema already rejects null/out-of-range on SUCCEEDED
+    meta = instance.get("meta")
+    schema_version = meta.get("schema_version") if isinstance(meta, dict) else None
+    version_problem = _exit_code_version_problem(schema_version, exit_code)
+    if version_problem is not None:
+        problems.append(version_problem)
+        return problems
+    if exit_code not in expected_exit_codes:
+        problems.append(
+            f"SUCCEEDED exit_code={exit_code!r} not in expected_exit_codes "
+            f"{sorted(expected_exit_codes)} of the resolved script"
+        )
     return problems

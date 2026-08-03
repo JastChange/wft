@@ -67,6 +67,10 @@ def _envelope(payload: dict) -> dict:
     return {"meta": _meta(), "payload": payload}
 
 
+def _envelope_v(schema_version: str, payload: dict) -> dict:
+    return {"meta": _meta(schema_version=schema_version), "payload": payload}
+
+
 def _failed_payload() -> dict:
     return _payload(
         status="FAILED",
@@ -133,6 +137,48 @@ def test_schema_errors_survive_cross_contract_validation() -> None:
         _envelope(_payload(exit_code=None)), expected_exit_codes=(0,)
     )
     assert problems
+
+
+# ---------------------------------------------------------------- version binding
+
+def test_v100_code_zero_is_compatible() -> None:
+    # A 1.0.x producer may still emit SUCCEEDED exit_code=0 (compatible read).
+    assert cv.validate_execution_result(_envelope_v("1.0.0", _payload(exit_code=0))) == []
+
+
+def test_v100_code_42_is_rejected() -> None:
+    # 1.0.x never allowed a non-zero success code, even if the script declares it.
+    problems = cv.validate_execution_result(
+        _envelope_v("1.0.0", _payload(exit_code=42)), expected_exit_codes=(0, 42)
+    )
+    assert any("schema_version" in p and "1.1.0" in p for p in problems)
+
+
+def test_v110_declared_42_accepted() -> None:
+    assert cv.validate_execution_result(
+        _envelope_v("1.1.0", _payload(exit_code=42)), expected_exit_codes=(0, 42)
+    ) == []
+
+
+def test_v120_declared_42_compatible() -> None:
+    # A higher compatible MINOR keeps the 1.1.0 behaviour.
+    assert cv.validate_execution_result(
+        _envelope_v("1.2.0", _payload(exit_code=42)), expected_exit_codes=(0, 42)
+    ) == []
+
+
+def test_v200_unsupported_major_rejected() -> None:
+    # Unsupported major must be rejected outright, even for exit_code=0.
+    problems = cv.validate_execution_result(_envelope_v("2.0.0", _payload(exit_code=0)))
+    assert any("major" in p and "2" in p for p in problems)
+
+
+def test_v110_declared_42_still_needs_declaration() -> None:
+    # Version >= 1.1.0 makes 42 legal, but the script must still declare it.
+    problems = cv.validate_execution_result(
+        _envelope_v("1.2.0", _payload(exit_code=42)), expected_exit_codes=(0,)
+    )
+    assert any("expected_exit_codes" in p for p in problems)
 
 
 # ----------------------------------------------------------------------- Script model
