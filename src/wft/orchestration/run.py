@@ -13,7 +13,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from wft.contracts.errors import WFTContractError
+from wft.contracts.errors import WFTError
 from wft.contracts.validate import validate_contract
 from wft.execution.result import build_execution_result, classify_exit
 from wft.execution.retry import backoff_seconds, should_retry
@@ -22,7 +22,7 @@ from wft.idgen import new_uuid7
 from wft.scriptreg.registry import Script
 from wft.storage.store import Store
 
-from .events import build_event, now_iso
+from .events import build_event, build_outbox_event, now_iso
 
 
 def build_run_spec(
@@ -124,7 +124,11 @@ async def execute_run(
     loop = asyncio.get_running_loop()
     start = loop.time()
 
-    store.start_run(run_id, lease_owner=lease_owner)
+    if not store.start_run(run_id, lease_owner=lease_owner):
+        raise WFTError(
+            f"run {run_id}: could not start (expected QUEUED; "
+            "a RUNNING lease must go through resume, not a plain overwrite)"
+        )
     store.insert_run_event(
         run_id,
         build_event(
@@ -150,7 +154,11 @@ async def execute_run(
 
     for node in nodes:
         node_id = node["node_id"]
-        store.set_node_task(run_id, node_id, "RUNNING")
+        if not store.set_node_task(run_id, node_id, "RUNNING"):
+            raise WFTError(
+                f"node {node_id}: cannot transition to RUNNING "
+                "(terminal node task cannot be rewritten)"
+            )
         store.insert_run_event(
             run_id,
             build_event(
@@ -186,7 +194,12 @@ async def execute_run(
             node_id,
             result=result,
             checkpoint_status=status,
-            outbox_event=None,
+            outbox_event=build_outbox_event(
+                object_type="execution_result",
+                object_id=payload["execution_uid"],
+                event_type="execution_result.completed",
+                payload=payload,
+            ),
             node_event=build_event(
                 run_id,
                 "node_finished",
@@ -196,11 +209,8 @@ async def execute_run(
                 execution_uid=payload["execution_uid"],
                 data={"status": status},
             ),
+            attempts=attempts,
         )
-        if attempts:
-            store.record_attempts(
-                run_id, node_id, payload["execution_uid"], attempts
-            )
 
     finished_at = now_iso()
     duration_ms = int((loop.time() - start) * 1000)
@@ -228,7 +238,12 @@ async def execute_run(
         run_status=run_status,
         batch_status=batch_status,
         summary=summary,
-        outbox_event=None,
+        outbox_event=build_outbox_event(
+            object_type="batch_summary",
+            object_id=run_id,
+            event_type="batch_summary.final",
+            payload=summary["payload"],
+        ),
         final_event=build_event(run_id, final_event_type, final_message),
     )
     return RunOutcome(

@@ -157,8 +157,10 @@ def test_start_run_and_lease(store: Store) -> None:
     row = store.get_run(rid)
     assert row["status"] == "RUNNING"
     assert row["lease_owner"] == "worker-1"
-    # A different owner cannot take the live lease.
-    assert store.start_run(rid, lease_owner="worker-2") is True  # RUNNING re-entrant
+    # Only QUEUED -> RUNNING is allowed; a different owner cannot take the live
+    # lease with a plain start (resume must go through acquire_resume_lock).
+    assert store.start_run(rid, lease_owner="worker-2") is False
+    assert store.get_run(rid)["lease_owner"] == "worker-1"
 
 
 def test_renew_lease_lost_returns_false(store: Store) -> None:
@@ -175,6 +177,34 @@ def test_acquire_resume_lock_requires_stale_heartbeat(store: Store) -> None:
     store.start_run(rid, lease_owner="worker-1")
     # Heartbeat is fresh; resume must not succeed.
     assert store.acquire_resume_lock(rid, lease_owner="worker-2") is False
+
+
+def test_acquire_resume_lock_stale_gate_is_lease_seconds(store: Store) -> None:
+    """Heartbeat renews every 10s but the stale gate is the full 60s lease."""
+    from datetime import datetime, timedelta, timezone
+
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.start_run(rid, lease_owner="worker-1")
+    now = datetime.now(timezone.utc)
+
+    def _age(seconds_ago: int) -> None:
+        past = (now - timedelta(seconds=seconds_ago)).isoformat()
+        conn = store.database.connect()
+        conn.execute(
+            "UPDATE runs SET heartbeat_at=?, lease_expires_at=? WHERE run_id=?",
+            (past, past, rid),
+        )
+        conn.commit()
+        conn.close()
+
+    # 30s-old heartbeat is within the 60s gate: still owned by worker-1.
+    _age(30)
+    assert store.acquire_resume_lock(rid, lease_owner="worker-2") is False
+    # 90s-old heartbeat + lapsed lease: resumable via the CAS.
+    _age(90)
+    assert store.acquire_resume_lock(rid, lease_owner="worker-2") is True
+    assert store.get_run(rid)["lease_owner"] == "worker-2"
 
 
 # ------------------------------------------------------- node result commit
@@ -209,16 +239,31 @@ def test_commit_execution_result_atomic(store: Store) -> None:
                 "data": {},
             }
         },
+        attempts=[
+            {
+                "attempt_id": "0190a2b3-c4d5-46e7-8890-1234567890ae",
+                "attempt_seq": 1,
+                "status": "SUCCEEDED",
+                "error_class": None,
+                "error_category": None,
+                "error_message": None,
+                "retryable": False,
+                "started_at": "2026-08-03T10:00:01+00:00",
+                "finished_at": "2026-08-03T10:00:02+00:00",
+            }
+        ],
     )
-    assert ack["object_type"] == "execution_result"
-    assert ack["object_id"] == execution_uid
-    assert ack["outbox_event_ids"] == ["0190a2b3-c4d5-46e7-8890-1234567890ac"]
+    assert ack["meta"]["schema_name"] == "contract-06-persist-ack"
+    assert ack["payload"]["object_type"] == "execution_result"
+    assert ack["payload"]["object_id"] == execution_uid
+    assert ack["payload"]["outbox_event_ids"] == ["0190a2b3-c4d5-46e7-8890-1234567890ac"]
 
     conn = store.database.connect()
     assert conn.execute("SELECT 1 FROM executions WHERE execution_uid=?", (execution_uid,)).fetchone()
     outbox = conn.execute("SELECT status FROM outbox WHERE event_id=?", ("0190a2b3-c4d5-46e7-8890-1234567890ac",)).fetchone()
     assert outbox["status"] == "pending"
     assert conn.execute("SELECT 1 FROM run_events WHERE event_id=?", ("0190a2b3-c4d5-46e7-8890-1234567890ad",)).fetchone()
+    assert conn.execute("SELECT 1 FROM attempts WHERE attempt_id=?", ("0190a2b3-c4d5-46e7-8890-1234567890ae",)).fetchone()
     task = conn.execute("SELECT status, execution_uid FROM node_tasks WHERE run_id=? AND node_id=?", (rid, "node-a")).fetchone()
     assert task["status"] == "SUCCEEDED"
     assert task["execution_uid"] == execution_uid
@@ -267,8 +312,9 @@ def test_finalize_run(store: Store) -> None:
             }
         },
     )
-    assert ack["object_type"] == "batch_summary"
-    assert ack["object_id"] == rid
+    assert ack["meta"]["schema_name"] == "contract-06-persist-ack"
+    assert ack["payload"]["object_type"] == "batch_summary"
+    assert ack["payload"]["object_id"] == rid
     row = store.get_run(rid)
     assert row["status"] == "SUCCESS"
     assert row["batch_status"] == "success"
@@ -276,6 +322,151 @@ def test_finalize_run(store: Store) -> None:
     assert conn.execute("SELECT 1 FROM batch_summaries WHERE run_id=?", (rid,)).fetchone()
     assert conn.execute("SELECT 1 FROM outbox WHERE event_id=?", ("0190a2b3-c4d5-46e7-8890-1234567890ac",)).fetchone()
     conn.close()
+
+
+def _summary(run_id: str, *, exit_code: int = 0) -> dict:
+    return {
+        "payload": {
+            "summary_revision": 1,
+            "run_status": "SUCCESS" if exit_code == 0 else "SUCCESS",
+            "batch_status": "success" if exit_code == 0 else "failed",
+            "final": True,
+            "counts": {
+                "targeted": 1, "succeeded": 1 if exit_code == 0 else 0,
+                "failed": 0 if exit_code == 0 else 1,
+                "unknown": 0, "cancelled": 0, "skipped": 0,
+            },
+            "error_counts": {},
+            "started_at": "2026-08-03T10:00:01+00:00",
+            "finished_at": "2026-08-03T10:00:02+00:00",
+            "duration_ms": 1000,
+            "exit_code": exit_code,
+        }
+    }
+
+
+def _outbox_event(object_type: str, object_id: str, event_id: str) -> dict:
+    return {
+        "event_id": event_id,
+        "object_type": object_type,
+        "object_id": object_id,
+        "event_type": "x.final" if object_type == "batch_summary" else "x.completed",
+        "payload": {"object_id": object_id},
+    }
+
+
+def _run_event(event_id: str, *, event_type: str = "run_completed") -> dict:
+    return {
+        "payload": {
+            "event_id": event_id,
+            "event_type": event_type,
+            "severity": "info",
+            "occurred_at": "2026-08-03T10:00:02+00:00",
+            "message": "done",
+            "data": {},
+        }
+    }
+
+
+def test_commit_execution_result_replay_returns_original(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    args = dict(
+        run_id=rid,
+        node_id="node-a",
+        result=_result(rid, "node-a", uid),
+        checkpoint_status="SUCCEEDED",
+        outbox_event=_outbox_event("execution_result", uid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+        node_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad", event_type="node_finished"),
+    )
+    first = store.commit_execution_result(**args)
+    replay = store.commit_execution_result(**args)
+    assert replay["payload"]["object_id"] == first["payload"]["object_id"]
+    assert replay["payload"]["outbox_event_ids"] == ["0190a2b3-c4d5-46e7-8890-1234567890ac"]
+    conn = store.database.connect()
+    assert conn.execute("SELECT COUNT(*) FROM executions").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 1
+    conn.close()
+
+
+def test_commit_execution_result_conflict_on_different_content(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    uid = "0190a2b3-c4d5-46e7-8890-1234567890ab"
+    store.commit_execution_result(
+        rid,
+        "node-a",
+        result=_result(rid, "node-a", uid, status="SUCCEEDED"),
+        checkpoint_status="SUCCEEDED",
+        outbox_event=_outbox_event("execution_result", uid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+        node_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad", event_type="node_finished"),
+    )
+    with pytest.raises(WFTIdempotencyConflict):
+        store.commit_execution_result(
+            rid,
+            "node-a",
+            result=_result(rid, "node-a", uid, status="FAILED"),
+            checkpoint_status="FAILED",
+            outbox_event=_outbox_event("execution_result", uid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+            node_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad", event_type="node_finished"),
+        )
+
+
+def test_finalize_run_terminal_replay_returns_ack(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    args = dict(
+        run_id=rid,
+        run_status="SUCCESS",
+        batch_status="success",
+        summary=_summary(rid),
+        outbox_event=_outbox_event("batch_summary", rid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+        final_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad"),
+    )
+    first = store.finalize_run(**args)
+    replay = store.finalize_run(**args)
+    assert replay["payload"]["object_id"] == first["payload"]["object_id"]
+    assert store.get_run(rid)["status"] == "SUCCESS"
+    conn = store.database.connect()
+    assert conn.execute("SELECT COUNT(*) FROM batch_summaries").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 1
+    conn.close()
+
+
+def test_finalize_run_terminal_conflict_on_different_summary(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.finalize_run(
+        run_id=rid,
+        run_status="SUCCESS",
+        batch_status="success",
+        summary=_summary(rid, exit_code=0),
+        outbox_event=_outbox_event("batch_summary", rid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+        final_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad"),
+    )
+    with pytest.raises(WFTIdempotencyConflict):
+        store.finalize_run(
+            run_id=rid,
+            run_status="SUCCESS",
+            batch_status="failed",
+            summary=_summary(rid, exit_code=1),
+            outbox_event=_outbox_event("batch_summary", rid, "0190a2b3-c4d5-46e7-8890-1234567890ac"),
+            final_event=_run_event("0190a2b3-c4d5-46e7-8890-1234567890ad"),
+        )
+
+
+def test_set_node_task_forbids_terminal_rewrite(store: Store) -> None:
+    rid = "01HX0" + "A" * 21
+    store.create_run(_run_spec(rid))
+    store.insert_node_tasks(rid, ["node-a"])
+    assert store.set_node_task(rid, "node-a", "RUNNING") is True
+    assert store.set_node_task(rid, "node-a", "SUCCEEDED") is True
+    # Terminal node task cannot be rewritten.
+    assert store.set_node_task(rid, "node-a", "FAILED") is False
+    assert store.get_node_task(rid, "node-a")["status"] == "SUCCEEDED"
 
 
 # ------------------------------------------------------------------- blobs

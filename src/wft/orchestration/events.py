@@ -16,6 +16,29 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def build_outbox_event(
+    *,
+    object_type: str,
+    object_id: str,
+    event_type: str,
+    payload: dict,
+) -> dict:
+    """Build a real outbox row payload for the atomic commit boundary.
+
+    The outbox row is registered in the same transaction as the business object
+    (Phase 2 binding); the dispatcher is a later stage. ``payload`` carries the
+    object payload downstream consumers need (Contract-03 payload / Contract-05
+    payload).
+    """
+    return {
+        "event_id": new_uuid7(),
+        "object_type": object_type,
+        "object_id": object_id,
+        "event_type": event_type,
+        "payload": payload,
+    }
+
+
 def build_event(
     run_id: str,
     event_type: str,

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterator
 
 from wft.contracts.errors import WFTError, WFTIdempotencyConflict, WFTStorageError
+from wft.contracts.validate import validate_contract
 
 from .blobs import BlobStore
 from .db import Database
@@ -148,7 +149,12 @@ class Store:
     # ------------------------------------------------------ run lifecycle
 
     def start_run(self, run_id: str, *, lease_owner: str) -> bool:
-        """Transition QUEUED -> RUNNING, taking the recovery lease atomically."""
+        """Transition QUEUED -> RUNNING, taking the recovery lease atomically.
+
+        Only a QUEUED run may be started. A live RUNNING run owned by another
+        worker must go through ``acquire_resume_lock`` (heartbeat + lease CAS),
+        never a plain overwrite; False means the transition did not apply.
+        """
         now = now_iso()
         lease_expires = _add_seconds(now, LEASE_SECONDS)
         with self.transaction() as conn:
@@ -156,7 +162,7 @@ class Store:
                 "UPDATE runs SET status='RUNNING', batch_status=NULL, "
                 "heartbeat_at=?, lease_owner=?, lease_expires_at=?, "
                 "started_at=COALESCE(started_at, ?), updated_at=? "
-                "WHERE run_id=? AND status IN ('QUEUED','RUNNING')",
+                "WHERE run_id=? AND status='QUEUED'",
                 (now, lease_owner, lease_expires, now, now, run_id),
             )
             return cur.rowcount == 1
@@ -174,9 +180,14 @@ class Store:
             return cur.rowcount == 1
 
     def acquire_resume_lock(self, run_id: str, lease_owner: str) -> bool:
-        """Single-CAS resume: Run=RUNNING, heartbeat stale, lease expired."""
+        """Single-CAS resume: Run=RUNNING, heartbeat stale, lease expired.
+
+        The heartbeat is renewed every ``HEARTBEAT_SECONDS`` but the stale gate
+        is the full ``LEASE_SECONDS``: a worker only reclaims a Run whose lease
+        has actually lapsed, never one that is merely slow to heartbeat.
+        """
         now = now_iso()
-        stale_before = _add_seconds(now, -HEARTBEAT_SECONDS)
+        stale_before = _add_seconds(now, -LEASE_SECONDS)
         lease_expires = _add_seconds(now, LEASE_SECONDS)
         with self.transaction() as conn:
             cur = conn.execute(
@@ -206,23 +217,30 @@ class Store:
         *,
         execution_uid: str | None = None,
         error_class: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Transition a node task under CAS; False when the rewrite is illegal.
+
+        Terminal statuses may never be rewritten and RUNNING may only follow a
+        non-terminal state, so a finished node cannot be silently re-flagged.
+        """
         now = now_iso()
         with self.transaction() as conn:
             if status in ("RUNNING",):
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, "
                     "started_at=COALESCE(started_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=?",
+                    "WHERE run_id=? AND node_id=? AND status IN ('PENDING','RUNNING')",
                     (status, execution_uid, now, now, run_id, node_id),
                 )
             else:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
                     "finished_at=COALESCE(finished_at, ?), updated_at=? "
-                    "WHERE run_id=? AND node_id=?",
-                    (status, execution_uid, error_class, now, now, run_id, node_id),
+                    "WHERE run_id=? AND node_id=? "
+                    "AND (status IN ('PENDING','RUNNING') OR status=?)",
+                    (status, execution_uid, error_class, now, now, run_id, node_id, status),
                 )
+            return cur.rowcount == 1
 
     # --------------------------------------------------- node result commit
 
@@ -235,20 +253,42 @@ class Store:
         checkpoint_status: str,
         outbox_event: dict,
         node_event: dict,
+        attempts: list[dict] | None = None,
     ) -> dict:
-        """Atomically persist ExecutionResult + checkpoint + outbox + event.
+        """Atomically persist ExecutionResult + final attempt + checkpoint + outbox + event.
 
-        ``result`` is a Contract-03 payload; ``outbox_event`` and ``node_event``
-        are the real outbox row payload and the Contract-09 payload data. The
-        write is idempotent on ``execution_uid`` (AC-011).
+        ``result`` is a Contract-03 envelope; ``attempts`` are the per-attempt
+        rows for this execution; ``outbox_event`` and ``node_event`` are the
+        real outbox row and the Contract-09 event. The write is immutable on
+        ``execution_uid`` (AC-011): a replay with identical content returns the
+        original ack, a replay with different content raises
+        :class:`WFTIdempotencyConflict`.
         """
         payload = result["payload"]
         execution_uid = payload["execution_uid"]
         now = now_iso()
         ack_event_ids: list[str] = []
         with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT result_json FROM executions WHERE execution_uid=?",
+                (execution_uid,),
+            ).fetchone()
+            if existing is not None:
+                # AC-011 replay: identical content returns the original ack;
+                # different content is a conflict, never an overwrite.
+                if existing["result_json"] != _j(result):
+                    raise WFTIdempotencyConflict(
+                        f"execution_uid {execution_uid} already persisted "
+                        "with different content"
+                    )
+                ack_event_ids = self._outbox_event_ids(
+                    conn, "execution_result", execution_uid
+                )
+                return self._persist_ack(
+                    "execution_result", execution_uid, now, ack_event_ids
+                )
             conn.execute(
-                "INSERT OR REPLACE INTO executions "
+                "INSERT INTO executions "
                 "(run_id, node_id, execution_uid, script_sha256, status, attempt_count, "
                 "started_at, finished_at, duration_ms, exit_code, stdout_json, "
                 "stderr_json, error_json, result_json, created_at) "
@@ -263,38 +303,9 @@ class Store:
                     _j(result), now,
                 ),
             )
-            if outbox_event:
+            for attempt in attempts or ():
                 conn.execute(
-                    "INSERT INTO outbox (event_id, object_type, object_id, event_type, "
-                    "payload_json, status, attempts, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)",
-                    (
-                        outbox_event["event_id"], outbox_event["object_type"],
-                        outbox_event["object_id"], outbox_event["event_type"],
-                        _j(outbox_event["payload"]), now,
-                    ),
-                )
-                ack_event_ids.append(outbox_event["event_id"])
-            self._insert_event(conn, run_id, node_event)
-            conn.execute(
-                "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
-                "finished_at=?, updated_at=? WHERE run_id=? AND node_id=?",
-                (
-                    checkpoint_status, execution_uid,
-                    (payload.get("error") or {}).get("class"),
-                    now, now, run_id, node_id,
-                ),
-            )
-        return self._persist_ack("execution_result", execution_uid, now, ack_event_ids)
-
-    def record_attempts(
-        self, run_id: str, node_id: str, execution_uid: str, attempts: list[dict]
-    ) -> None:
-        """Append per-attempt rows for an execution (attempt_id unique per try)."""
-        with self.transaction() as conn:
-            for attempt in attempts:
-                conn.execute(
-                    "INSERT OR REPLACE INTO attempts "
+                    "INSERT INTO attempts "
                     "(execution_uid, attempt_id, attempt_seq, status, error_class, "
                     "error_category, error_message, retryable, started_at, finished_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -311,6 +322,30 @@ class Store:
                         attempt["finished_at"],
                     ),
                 )
+            if outbox_event:
+                conn.execute(
+                    "INSERT INTO outbox (event_id, object_type, object_id, event_type, "
+                    "payload_json, status, attempts, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)",
+                    (
+                        outbox_event["event_id"], outbox_event["object_type"],
+                        outbox_event["object_id"], outbox_event["event_type"],
+                        _j(outbox_event["payload"]), now,
+                    ),
+                )
+                ack_event_ids.append(outbox_event["event_id"])
+            self._insert_event(conn, run_id, node_event)
+            conn.execute(
+                "UPDATE node_tasks SET status=?, execution_uid=?, error_class=?, "
+                "finished_at=?, updated_at=? WHERE run_id=? AND node_id=? "
+                "AND (status IN ('PENDING','RUNNING') OR status=?)",
+                (
+                    checkpoint_status, execution_uid,
+                    (payload.get("error") or {}).get("class"),
+                    now, now, run_id, node_id, checkpoint_status,
+                ),
+            )
+        return self._persist_ack("execution_result", execution_uid, now, ack_event_ids)
 
     def insert_run_event(self, run_id: str, event: dict) -> dict:
         now = now_iso()
@@ -329,21 +364,44 @@ class Store:
         outbox_event: dict,
         final_event: dict,
     ) -> dict:
-        """Atomically persist the final BatchSummary + run terminal state."""
+        """Atomically persist the final BatchSummary + run terminal state.
+
+        The Run UPDATE is the single terminal transition: only when it changes
+        exactly one row are the summary/outbox/event written. A repeated
+        finalize of an already-terminal Run is an idempotent replay (identical
+        summary returns the original ack; different content raises conflict).
+        """
         now = now_iso()
         ack_event_ids: list[str] = []
         with self.transaction() as conn:
-            revision = summary["payload"]["summary_revision"]
-            conn.execute(
-                "INSERT OR REPLACE INTO batch_summaries "
-                "(run_id, summary_revision, summary_json, final, created_at) "
-                "VALUES (?, ?, ?, 1, ?)",
-                (run_id, revision, _j(summary["payload"]), now),
-            )
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE runs SET status=?, batch_status=?, finished_at=?, updated_at=? "
                 "WHERE run_id=? AND status NOT IN ('SUCCESS','DEGRADED','FAILED','CANCELLED')",
                 (run_status, batch_status, now, now, run_id),
+            )
+            if cur.rowcount != 1:
+                # Already terminal: nothing may be rewritten. A replay must
+                # reproduce the stored summary; different content is a conflict.
+                existing = conn.execute(
+                    "SELECT summary_json FROM batch_summaries WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if existing is None:
+                    raise WFTStorageError(
+                        f"run {run_id} is already terminal but has no stored summary"
+                    )
+                if existing["summary_json"] != _j(summary["payload"]):
+                    raise WFTIdempotencyConflict(
+                        f"run {run_id} is already terminal; "
+                        "cannot finalize with a different summary"
+                    )
+                ack_event_ids = self._outbox_event_ids(conn, "batch_summary", run_id)
+                return self._persist_ack("batch_summary", run_id, now, ack_event_ids)
+            conn.execute(
+                "INSERT INTO batch_summaries "
+                "(run_id, summary_revision, summary_json, final, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (run_id, summary["payload"]["summary_revision"], _j(summary["payload"]), now),
             )
             if outbox_event:
                 conn.execute(
@@ -379,13 +437,25 @@ class Store:
     def _persist_ack(
         self, object_type: str, object_id: str, committed_at: str, event_ids: list[str]
     ) -> dict:
-        return {
-            "object_type": object_type,
-            "object_id": object_id,
-            "committed_at": committed_at,
-            "storage_version": SCHEMA_VERSION,
-            "outbox_event_ids": event_ids,
+        """Build and validate a Contract-06 PersistAck envelope (not a bare payload)."""
+        envelope = {
+            "meta": {
+                "schema_name": "contract-06-persist-ack",
+                "schema_version": "1.0.0",
+                "producer": "wft.storage",
+                "created_at": committed_at,
+                "stage": "persistence",
+            },
+            "payload": {
+                "object_type": object_type,
+                "object_id": object_id,
+                "committed_at": committed_at,
+                "storage_version": SCHEMA_VERSION,
+                "outbox_event_ids": event_ids,
+            },
         }
+        validate_contract("contract-06-persist-ack", envelope)
+        return envelope
 
     def get_batch_summary(self, run_id: str) -> dict | None:
         """Return the stored Contract-05 payload for a Run, or None."""
@@ -395,6 +465,17 @@ class Store:
                 (run_id,),
             ).fetchone()
             return json.loads(row["summary_json"]) if row else None
+
+    def _outbox_event_ids(
+        self, conn: sqlite3.Connection, object_type: str, object_id: str
+    ) -> list[str]:
+        return [
+            r["event_id"]
+            for r in conn.execute(
+                "SELECT event_id FROM outbox WHERE object_type=? AND object_id=?",
+                (object_type, object_id),
+            ).fetchall()
+        ]
 
 
 HEARTBEAT_SECONDS = 10
