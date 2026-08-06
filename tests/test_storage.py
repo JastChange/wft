@@ -368,7 +368,6 @@ def test_resume_audit_and_checkpoints_in_same_tx(tmp_path: Path) -> None:
     their execution_uid) with a per-node checkpoint_updated event each, while
     PENDING and terminal checkpoints stay untouched -- all in one transaction
     with the run-level resume audit."""
-    from datetime import datetime, timedelta, timezone
 
     store = Store(Database(tmp_path / "wft.db"), blob_dir=tmp_path / "blobs")
     rid = "01HX0" + "A" * 21
@@ -684,7 +683,7 @@ def _summary(run_id: str, *, exit_code: int = 0) -> dict:
     return {
         "payload": {
             "summary_revision": 1,
-            "run_status": "SUCCESS" if exit_code == 0 else "SUCCESS",
+            "run_status": "SUCCESS",
             "batch_status": "success" if exit_code == 0 else "failed",
             "final": True,
             "counts": {
