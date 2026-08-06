@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Iterator
 
 from wft.contracts.errors import (
-    WFTError,
     WFTIdempotencyConflict,
     WFTLeaseLostError,
     WFTStorageError,
@@ -145,7 +144,6 @@ class Store:
             return dict(row) if row else None
 
     def insert_node_tasks(self, run_id: str, node_ids: list[str]) -> None:
-        now = now_iso()
         with self.transaction() as conn:
             for node_id in node_ids:
                 conn.execute(
@@ -213,7 +211,7 @@ class Store:
     def is_resume_eligible(self, run: dict) -> bool:
         """True when a RUNNING run may be resumed (heartbeat stale, lease expired).
 
-        The heartbeat is renewed every ``HEARTBEAT_SECONDS`` but the stale gate
+        The heartbeat is renewed periodically, but the stale gate
         is the full ``LEASE_SECONDS``: a worker only reclaims a Run whose lease
         has actually lapsed, never one that is merely slow to heartbeat. This is
         a read-only pre-check; the authoritative gate is the ``resume_run`` CAS.
@@ -844,7 +842,6 @@ class Store:
         ]
 
 
-HEARTBEAT_SECONDS = 10
 LEASE_SECONDS = 60
 
 
