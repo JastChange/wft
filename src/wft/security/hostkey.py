@@ -14,16 +14,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from wft.contracts.errors import WFTError
-
-KEYS_KNOWN_HOSTS_MARKER = "@cert-authority "
-
 
 @dataclass
 class DiscoveredKey:
