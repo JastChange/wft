@@ -90,7 +90,7 @@ async def execute_script(
     )
     try:
         conn = await asyncssh.connect(**connect_kwargs)
-    except (asyncssh.HostKeyNotVerifiable,) as exc:
+    except asyncssh.HostKeyNotVerifiable as exc:
         err_cls = "host_key_mismatch" if host_known else "host_key_unknown"
         return ExecutionOutcome(error=error_dict(err_cls, str(exc)))
     except (asyncio.TimeoutError, OSError, asyncssh.Error) as exc:
