@@ -16,9 +16,6 @@ import yaml
 from wft.contracts import registry as contract_registry
 from wft.contracts.errors import WFTScriptRegistryError
 
-SHA256_PATTERN_LEN = 64
-
-
 @dataclass(frozen=True)
 class Script:
     name: str
