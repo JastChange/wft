@@ -1,7 +1,6 @@
 """Contract-03 result building: output bounds, binary degradation, flags."""
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 import pytest
@@ -145,7 +144,7 @@ def test_pre_capped_tail_reports_total_overflow(blobs: BlobStore) -> None:
 
 def test_non_utf8_binary_blob_degrades(blobs: BlobStore) -> None:
     data = b"\xff\xfe binary \x00 bytes"
-    stream, flags, degraded, err = build_stream("stdout", data, blobs)
+    stream, _flags, degraded, err = build_stream("stdout", data, blobs)
     assert stream["encoding"] == "binary"
     assert "blob_ref" in stream
     assert blobs.read(stream["blob_ref"]) == data
@@ -171,7 +170,7 @@ def test_blob_write_failure_utf8_falls_back_to_inline(blobs: BlobStore) -> None:
 def test_blob_write_failure_binary_is_unrecoverable(blobs: BlobStore) -> None:
     # Binary output cannot be inlined, so a blob write failure must signal the
     # caller to mark the result FAILED.
-    stream, flags, degraded, err = build_stream(
+    stream, _flags, degraded, err = build_stream(
         "stdout", b"\xff\x00\x01", _WriteFails(blobs.blob_dir)
     )
     assert stream is None
@@ -222,7 +221,7 @@ def test_nonzero_expected_success_valid(blobs: BlobStore) -> None:
 def test_failure_result_has_error(blobs: BlobStore) -> None:
     from wft.execution.errors import error_dict
 
-    env, degraded, _ = _build(
+    env, _degraded, _ = _build(
         blobs,
         status="FAILED",
         exit_code=1,
@@ -301,7 +300,7 @@ def test_blob_write_retries_without_degrading(blobs: BlobStore) -> None:
     # no degradation, and the SSH attempt_count is untouched (this is internal).
     data = b"y" * (INLINE_STDOUT_CAP + 1024)
     store = _CountingBlob(blobs.blob_dir, failures=2)
-    stream, flags, degraded, err = build_stream("stdout", data, store, valid_utf8=True)
+    stream, _flags, degraded, err = build_stream("stdout", data, store, valid_utf8=True)
     assert store.calls == 3
     assert err is None
     assert degraded is False
@@ -331,7 +330,7 @@ def test_binary_blob_write_retries_then_succeeds(blobs: BlobStore) -> None:
     # internally instead of failing the result.
     data = b"\xff\x00 binary \x01"
     store = _CountingBlob(blobs.blob_dir, failures=2)
-    stream, flags, degraded, err = build_stream("stdout", data, store)
+    stream, _flags, degraded, err = build_stream("stdout", data, store)
     assert store.calls == 3
     assert err is None
     assert stream is not None
@@ -342,7 +341,7 @@ def test_binary_blob_write_retries_then_succeeds(blobs: BlobStore) -> None:
 def test_binary_blob_write_all_fail_is_unrecoverable(blobs: BlobStore) -> None:
     data = b"\xff\x00 binary \x01"
     store = _CountingBlob(blobs.blob_dir, failures=3)
-    stream, flags, degraded, err = build_stream("stdout", data, store)
+    stream, _flags, _degraded, err = build_stream("stdout", data, store)
     assert store.calls == 3
     assert stream is None
     assert err["class"] == "blob_write_failed"
@@ -377,7 +376,7 @@ def test_utf8_blob_fallback_inline_aligns_boundary(blobs: BlobStore) -> None:
     size = 400000
     data = "你".encode() * size
     tail = data[-STREAM_HARD_CAP:]
-    stream, flags, degraded, err = build_stream(
+    stream, _flags, degraded, err = build_stream(
         "stdout", tail, _WriteFails(blobs.blob_dir), total_bytes=len(data), valid_utf8=True
     )
     assert err["class"] == "blob_write_failed"
