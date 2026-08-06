@@ -240,7 +240,7 @@ def _run_and_execute(tmp_path: Path, script_body: str):
     script = _script(script_path)
 
     async def _main():
-        host_key, client_key, host_key_path, client_key_path, client_pub_path = _make_host_keys(tmp_path)
+        host_key, _client_key, host_key_path, client_key_path, client_pub_path = _make_host_keys(tmp_path)
         from ssh_test_server import RunningServer
 
         async with RunningServer(host_key_path=host_key_path, authorized_keys=[client_pub_path]) as server:
@@ -374,7 +374,7 @@ def test_exec_nonzero_both_streams_blob_failure_persists_secondary(tmp_path: Pat
     script = _script(script_path)
 
     async def _main():
-        host_key, client_key, host_key_path, client_key_path, client_pub_path = _make_host_keys(tmp_path)
+        host_key, _client_key, host_key_path, client_key_path, client_pub_path = _make_host_keys(tmp_path)
         from ssh_test_server import RunningServer
 
         async with RunningServer(host_key_path=host_key_path, authorized_keys=[client_pub_path]) as server:
