@@ -1,7 +1,6 @@
 """CLI surface: exit codes and JSON output (命令契约 §7)."""
 from __future__ import annotations
 
-import argparse
 import json
 import subprocess
 import sys
@@ -9,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from wft.cli.main import build_parser, main
+from wft.cli.main import build_parser
 from wft.cli.common import EXIT_BUSINESS, EXIT_CONFIG, EXIT_OK
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
