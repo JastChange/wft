@@ -1,7 +1,6 @@
 """Retry bounds follow the error matrix (错误矩阵_v0.1.md)."""
 from __future__ import annotations
 
-import pytest
 
 from wft.execution.retry import backoff_seconds, max_attempts, should_retry
 
