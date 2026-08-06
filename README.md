@@ -1,55 +1,55 @@
-# WFT — 批次式 Linux 节点巡检与知识沉淀工具（MVP）
+# WFT — Linux 节点安装验证与故障诊断
 
-`wft` 在当前 Mac/Linux 控制机上，通过一条命令或本地定时任务对多台 Linux
-节点执行**只读**巡检脚本；自动识别异常，生成规则/AI 摘要，把历史结果保存
-在 SQLite，并单向导出到本机 Obsidian Vault；异常批次发送 webhook 通知。
+WFT 1.0 面向单个运维人员，在一台 Linux 控制服务器上对 Ubuntu 节点运行经过登记的只读脚本，用于：
 
-> 规格基线：`docs/spec/SPEC_BASELINE_v1.0.md`（Approved for Implementation）。
-> 实现交接清单：`docs/spec/IMPLEMENTATION_HANDOFF_v1.0.md`（Phase 0–1）。
+- 验证新安装操作系统是否符合预期；
+- 为故障节点收集完整、可追溯的判断证据；
+- 通过只读 Web 页面查看任务、节点、脚本和原始输出；
+- 按需发送 Webhook、执行 AI 辅助分析并导出 Obsidian 问题笔记。
 
-## 当前阶段（Phase 0–1）
+## 当前状态
 
-- ✅ 12 份数据契约 JSON Schema（`contracts/`，Contract-01～12）
-- ✅ 每份契约的正常/边界/错误样本与 CI 校验
-- ✅ CLI 骨架（`wft --help`）
-- ✅ `wft inventory check`（AC-001）
-- ✅ `wft hostkey onboard`（AC-002）
-- ✅ 只读 ScriptRegistry + 完整 SHA-256 校验（AC-005 / AC-008B）
+分支 `rewrite/node-diagnostics` 正在进行 1.0 全面重写。当前处于 **M0：需求与架构基线**，业务运行代码仍是归档前的旧 MVP 实现，不代表 1.0 行为。
 
-未实现命令（`run`/`history`/`scheduler`/`storage`/`export`）在后续阶段交付。
+未经里程碑验收，不应将当前分支部署为 WFT 1.0。
 
-## 安装
+## 权威文档
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[test]"
-wft --help
-```
+- [产品需求](docs/spec/PRODUCT_REQUIREMENTS_v1.0.md)
+- [架构](docs/spec/ARCHITECTURE_v1.0.md)
+- [权威数据格式](docs/spec/DATA_FORMATS_v1.0.md)
+- [验收矩阵](docs/spec/ACCEPTANCE_MATRIX_v1.0.md)
+- [需求追踪矩阵](docs/spec/TRACEABILITY_v1.0.md)
+- [交付计划](docs/spec/DELIVERY_PLAN_v1.0.md)
+- [领域词汇](CONTEXT.md)
+- [架构决策](docs/adr/)
 
-## 快速验证
+旧规格位于 `docs/archive/legacy-mvp/`，仅供追溯，不再约束实现。
 
-```bash
-wft inventory check --file config/inventory.example.yaml
-wft script check --file config/scripts.example.yaml
-wft script resolve --file config/scripts.example.yaml --ref disk-usage
-pytest
-```
+## 计划技术栈
 
-## 目录
+- Python 3.12
+- Typer CLI
+- FastAPI + 服务端模板
+- AsyncSSH
+- JSON/原始文件权威存储
+- 可重建 SQLite 查询索引
+- Docker Compose
 
-```text
-contracts/      # 12 份 JSON Schema（权威副本）
-config/         # 示例配置（仅假节点 / 假凭据引用）
-docs/spec/      # 已批准规格基线 + 实现交接清单（SSOT）
-scripts/        # 示例只读巡检脚本
-src/wft/        # Python 包
-tests/          # 单测与契约样本
-```
+## 计划运行边界
 
-## 使用边界（MVP 已接受风险）
+- 只支持 CLI 手动任务，不提供 Scheduler。
+- 目标节点为 Ubuntu 22.04/24.04，最多 50 台。
+- Web 仅在内网/VPN使用 HTTP，并且只有查看权限。
+- 允许 root/sudo，自动接受 SSH Host Key，直接信任配置的 Git 分支。
+- 不提供自动恢复、备份、通用审计、HTTPS、内容脱敏或旧数据迁移。
 
-- 不实现费用预算门禁与敏感信息脱敏（ADR-008）；执行输出按原文存储、导出
-  并可能发送给配置的 LLM。
-- 只支持 `read_only` 巡检脚本；`risk=mutating` 在注册阶段拒绝。
-- 配置只允许凭据引用，禁止把秘密正文写入仓库。
+这些是需求方明确确认的 1.0 边界；完整风险说明见产品需求和 ADR。
+
+## 贡献流程
+
+1. 先阅读 `AGENTS.md`、`CONTEXT.md` 和相关 ADR；
+2. 从产品需求和验收矩阵定位需求 ID；
+3. 使用 TDD 实现；
+4. 报告测试证据和任何规格偏差；
+5. 每个里程碑确认后再进入下一阶段。
