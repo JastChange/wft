@@ -246,7 +246,7 @@ def build_execution_result(
         total_bytes=stderr_total,
         valid_utf8=stderr_valid_utf8,
     )
-    flags = sorted(set([*stdout_flags, *stderr_flags, *extra_flags]))
+    flags = sorted({*stdout_flags, *stderr_flags, *extra_flags})
     unknown = set(flags) - FLAG_VALUES
     if unknown:
         raise ValueError(f"unknown result flags: {sorted(unknown)}")
