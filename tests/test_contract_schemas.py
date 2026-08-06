@@ -1,7 +1,6 @@
 """The 12 contract schemas load, are valid Draft 2020-12, and resolve $refs."""
 from __future__ import annotations
 
-import json
 
 import pytest
 from jsonschema import Draft202012Validator
