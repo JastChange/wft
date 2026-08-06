@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-import jsonschema
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 from referencing.exceptions import NoSuchResource
