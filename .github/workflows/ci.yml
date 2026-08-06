@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  contract-ci:
+  m1-ci:
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -27,15 +27,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test]"
-      - name: Contract schema CI (normal/boundary/error samples)
-        run: pytest tests/test_contract_schemas.py tests/test_contract_samples.py -q
-      - name: Schema copy drift check
-        run: pytest tests/test_schema_sync.py -q
+      - name: Ruff format check
+        run: ruff format --check src tests
+      - name: Ruff lint
+        run: ruff check src tests
+      - name: Strict type check
+        run: mypy src
+      - name: Manifest example validation
+        run: |
+          python -c "from pathlib import Path; from wft.scripts.manifest import load_manifest; load_manifest(Path('config/manifest.example.yaml'))"
       - name: CLI smoke test
         run: |
           wft --help >/dev/null
-          wft inventory check --file config/inventory.example.yaml
-          wft script check --file config/scripts.example.yaml
+          wft admin --help >/dev/null
+          wft config --help >/dev/null
+          wft inventory --help >/dev/null
+          wft scripts --help >/dev/null
       - name: Full unit test suite
         run: pytest -q
 
