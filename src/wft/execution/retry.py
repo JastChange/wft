@@ -10,9 +10,6 @@ import random
 
 from wft.contracts.validate import ERROR_MATRIX
 
-NO_RETRY_BEFORE = {"PERMANENT", "SECURITY", "DATA"}
-
-
 def max_attempts(error_class: str) -> int:
     """Return the maximum attempt_count (1-based) for an error class."""
     category, _ = ERROR_MATRIX[error_class]
