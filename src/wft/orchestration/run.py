@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 
 from wft.contracts.errors import WFTError, WFTLeaseLostError
 from wft.contracts.validate import validate_contract
