@@ -1,70 +1,34 @@
-"""Load inventory YAML, capturing the source line of every node field.
-
-Line numbers let ``wft inventory check`` report errors against the exact
-location in the user's file (AC-001).
-"""
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from wft.contracts.errors import WFTInventoryError
+from .models import Inventory
+
+SUPPORTED_OS = {"ubuntu-22.04", "ubuntu-24.04"}
 
 
-class LineLoader(yaml.SafeLoader):
-    """SafeLoader that records the line where each value starts."""
+def load_inventory(path: Path) -> Inventory:
+    path = path.expanduser().resolve()
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, dict):
+        raise TypeError("inventory root must be a mapping")
+    raw: dict[str, Any] = loaded
+    nodes = raw.get("nodes", [])
+    if not isinstance(nodes, list):
+        raise TypeError("inventory nodes must be a list")
 
-    def construct_mapping(self, node, deep=False):
-        mapping = super().construct_mapping(node, deep=deep)
-        mapping["__line__"] = node.start_mark.line + 1
-        return mapping
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise TypeError("inventory node must be a mapping")
+        key_path = Path(node["private_key_path"])
+        if not key_path.is_absolute():
+            raise ValueError(f"private key path must be absolute: {node.get('name', '<unknown>')}")
+        node["private_key_path"] = key_path.resolve()
+        if node.get("os") not in SUPPORTED_OS:
+            raise ValueError(f"unsupported target OS: {node.get('os')}")
 
-
-def load_yaml_with_lines(path: Path) -> tuple[dict, dict]:
-    """Return (data, line_index) where line_index maps path tuples to line numbers."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise WFTInventoryError(f"cannot read {path}: {exc}") from exc
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise WFTInventoryError(f"{path} is not valid YAML: {exc}") from exc
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        raise WFTInventoryError(f"{path} must contain a mapping at top level")
-    line_index = _index_lines(path)
-    return data, line_index
-
-
-def _index_lines(path: Path) -> dict:
-    loader = LineLoader(path.read_text(encoding="utf-8"))
-    index: dict = {}
-    try:
-        node = loader.get_single_node()
-        if node is None:
-            return index
-
-        def walk(node: Any, keypath: tuple):
-            if node.start_mark is not None:
-                index[keypath] = node.start_mark.line + 1
-            if isinstance(node, yaml.MappingNode):
-                for key_node, value_node in node.value:
-                    if isinstance(key_node, yaml.ScalarNode):
-                        walk(value_node, keypath + (key_node.value,))
-            elif isinstance(node, yaml.SequenceNode):
-                for i, child in enumerate(node.value):
-                    walk(child, keypath + (i,))
-
-        walk(node, ())
-    finally:
-        loader.dispose()
-    return index
-
-
-def line_for(line_index: dict, *keys) -> int | None:
-    """Return the line number for a path like ("nodes", 2, "node_id"), if known."""
-    return line_index.get(tuple(keys))
+    names = [node["name"] for node in nodes]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate node name")
+    return Inventory.model_validate(raw)

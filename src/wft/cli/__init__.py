@@ -1,1 +1,1 @@
-"""CLI command entry points."""
+"""Command-line interface for WFT."""

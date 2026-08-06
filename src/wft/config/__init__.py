@@ -1,1 +1,1 @@
-"""Global configuration loading."""
+"""Application configuration models and loading."""

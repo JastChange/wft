@@ -1,17 +1,44 @@
 # WFT — Linux 节点安装验证与故障诊断
 
-WFT 1.0 面向单个运维人员，在一台 Linux 控制服务器上对 Ubuntu 节点运行经过登记的只读脚本，用于：
-
-- 验证新安装操作系统是否符合预期；
-- 为故障节点收集完整、可追溯的判断证据；
-- 通过只读 Web 页面查看任务、节点、脚本和原始输出；
-- 按需发送 Webhook、执行 AI 辅助分析并导出 Obsidian 问题笔记。
+WFT 1.0 面向单个运维人员，在一台 Linux 控制服务器上对 Ubuntu 节点运行经过登记的只读脚本，用于安装验证和故障证据采集。
 
 ## 当前状态
 
-分支 `rewrite/node-diagnostics` 正在进行 1.0 全面重写。当前处于 **M0：需求与架构基线**，业务运行代码仍是归档前的旧 MVP 实现，不代表 1.0 行为。
+分支 `rewrite/node-diagnostics` 已完成 **M1：CLI、配置、Inventory 与脚本快照**：
 
-未经里程碑验收，不应将当前分支部署为 WFT 1.0。
+- Python 3.12 / Typer CLI 基线；
+- 权限为 `0600` 的类型化私有配置；
+- Ubuntu 22.04/24.04 节点清单和确定性选择；
+- 外部 Git 仓库最新脚本获取、Manifest 门禁和不可变快照；
+- 需要操作员明确同意的缓存脚本回退；
+- CLI 生成的管理员密码和 Argon2 哈希文件。
+
+任务执行、SSH、权威结果存储、只读 Web、Webhook、AI 和 Obsidian 导出将在 M2～M6 交付。当前版本不能执行诊断任务，也不应作为完整 WFT 1.0 部署。
+
+## 安装
+
+```bash
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[test]'
+wft --help
+```
+
+Python 要求为 `>=3.12,<3.13`。
+
+## M1 命令
+
+```text
+wft admin init --auth-file PATH
+wft admin reset-password --auth-file PATH
+wft config check --config PATH [--json]
+wft inventory check --config PATH [--json]
+wft inventory select --config PATH [--node NAME] [--group GROUP] [--tag TAG] [--all] [--json]
+wft scripts check --config PATH [--json]
+wft scripts sync --config PATH [--allow-cached-scripts] [--json]
+```
+
+详细配置、Manifest 和操作步骤见[配置与脚本操作指南](docs/operations/configuration.md)。示例文件位于 `config/`，其中只有假节点、假地址和假密钥路径。
 
 ## 权威文档
 
@@ -21,35 +48,24 @@ WFT 1.0 面向单个运维人员，在一台 Linux 控制服务器上对 Ubuntu 
 - [验收矩阵](docs/spec/ACCEPTANCE_MATRIX_v1.0.md)
 - [需求追踪矩阵](docs/spec/TRACEABILITY_v1.0.md)
 - [交付计划](docs/spec/DELIVERY_PLAN_v1.0.md)
+- [M1 验收证据](artifacts/acceptance/m1.md)
 - [领域词汇](CONTEXT.md)
 - [架构决策](docs/adr/)
 
 旧规格位于 `docs/archive/legacy-mvp/`，仅供追溯，不再约束实现。
 
-## 计划技术栈
+## 安全和运行边界
 
-- Python 3.12
-- Typer CLI
-- FastAPI + 服务端模板
-- AsyncSSH
-- JSON/原始文件权威存储
-- 可重建 SQLite 查询索引
-- Docker Compose
-
-## 计划运行边界
-
-- 只支持 CLI 手动任务，不提供 Scheduler。
-- 目标节点为 Ubuntu 22.04/24.04，最多 50 台。
-- Web 仅在内网/VPN使用 HTTP，并且只有查看权限。
-- 允许 root/sudo，自动接受 SSH Host Key，直接信任配置的 Git 分支。
-- 不提供自动恢复、备份、通用审计、HTTPS、内容脱敏或旧数据迁移。
-
-这些是需求方明确确认的 1.0 边界；完整风险说明见产品需求和 ADR。
+- 私有配置、脚本 Deploy Key 和节点私钥必须使用绝对路径；配置和 Deploy Key 必须为 `0600`。
+- YAML、JSON、日志和 Git 仓库中只保存密钥路径，不保存私钥正文。
+- WFT 直接信任配置的脚本仓库 URL 和分支，不验证 commit/tag 签名。
+- 每次同步先尝试远端最新提交；远端失败时，只有交互确认或 `--allow-cached-scripts` 才能使用已验证缓存。
+- 目前只支持 M1 手动命令，不提供任务执行、Scheduler、自动恢复或自动重试。
 
 ## 贡献流程
 
-1. 先阅读 `AGENTS.md`、`CONTEXT.md` 和相关 ADR；
+1. 阅读 `AGENTS.md`、`CONTEXT.md` 和相关 ADR；
 2. 从产品需求和验收矩阵定位需求 ID；
 3. 使用 TDD 实现；
-4. 报告测试证据和任何规格偏差；
+4. 报告测试证据和规格偏差；
 5. 每个里程碑确认后再进入下一阶段。

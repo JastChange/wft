@@ -1,6 +1,6 @@
 # WFT Node Diagnostics M1 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace the legacy MVP package with the WFT 1.0 CLI/config/inventory/script-snapshot foundation required by AC-001 through AC-006.
 
@@ -48,7 +48,7 @@ src/wft/
 - Preserve by moving: `tests/ssh_test_server.py` → `tests/support/ssh_test_server.py`
 - Create: `tests/test_package.py`
 
-- [ ] **Step 1: Move reusable fixtures, then remove legacy runtime/tests/contracts**
+- [x] **Step 1: Move reusable fixtures, then remove legacy runtime/tests/contracts**
 
 ```bash
 mkdir -p /tmp/wft-fixtures
@@ -60,7 +60,7 @@ cp /tmp/wft-fixtures/http_fault_stubs.py tests/support/
 cp /tmp/wft-fixtures/ssh_test_server.py tests/support/
 ```
 
-- [ ] **Step 2: Write the package smoke test**
+- [x] **Step 2: Write the package smoke test**
 
 ```python
 # tests/test_package.py
@@ -77,12 +77,12 @@ def test_version_and_help() -> None:
     assert "WFT node diagnostics" in result.stdout
 ```
 
-- [ ] **Step 3: Run the test and confirm RED**
+- [x] **Step 3: Run the test and confirm RED**
 
 Run: `.venv/bin/pytest tests/test_package.py -q`
 Expected: FAIL because the new package and CLI do not exist.
 
-- [ ] **Step 4: Replace `pyproject.toml` and add the minimal package**
+- [x] **Step 4: Replace `pyproject.toml` and add the minimal package**
 
 ```toml
 [build-system]
@@ -140,12 +140,12 @@ def root() -> None:
     """WFT node diagnostics."""
 ```
 
-- [ ] **Step 5: Reinstall and confirm GREEN**
+- [x] **Step 5: Reinstall and confirm GREEN**
 
 Run: `.venv/bin/python -m pip install -e '.[test]' && .venv/bin/pytest tests/test_package.py -q`
 Expected: `1 passed`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add pyproject.toml src tests
@@ -160,7 +160,7 @@ git commit -m "chore: establish WFT 1.0 package baseline"
 - Create: `tests/config/test_loader.py`
 - Create: `config/wft.example.yaml`
 
-- [ ] **Step 1: Write failing permission and validation tests**
+- [x] **Step 1: Write failing permission and validation tests**
 
 ```python
 # tests/config/test_loader.py
@@ -202,12 +202,12 @@ def test_rejects_group_readable_config(tmp_path: Path) -> None:
         load_config(cfg)
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `.venv/bin/pytest tests/config/test_loader.py -q`
 Expected: import failure.
 
-- [ ] **Step 3: Implement typed config and a strict loader**
+- [x] **Step 3: Implement typed config and a strict loader**
 
 ```python
 # src/wft/config/models.py
@@ -269,12 +269,12 @@ def load_config(path: Path) -> AppConfig:
     return AppConfig.model_validate(raw)
 ```
 
-- [ ] **Step 4: Run GREEN and static checks**
+- [x] **Step 4: Run GREEN and static checks**
 
 Run: `.venv/bin/pytest tests/config/test_loader.py -q && .venv/bin/ruff check src tests && .venv/bin/mypy src`
 Expected: all pass.
 
-- [ ] **Step 5: Add a fake-value example config and commit**
+- [x] **Step 5: Add a fake-value example config and commit**
 
 ```yaml
 # config/wft.example.yaml
@@ -304,7 +304,7 @@ git commit -m "feat: load private typed configuration"
 - Create: `tests/inventory/test_inventory.py`
 - Replace: `config/inventory.example.yaml`
 
-- [ ] **Step 1: Write selection tests**
+- [x] **Step 1: Write selection tests**
 
 ```python
 # tests/inventory/test_inventory.py
@@ -334,12 +334,12 @@ def test_group_tag_and_explicit_selection_is_deduplicated(tmp_path: Path) -> Non
     assert [node.name for node in selected] == ["node-a", "node-b"]
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `.venv/bin/pytest tests/inventory/test_inventory.py -q`
 Expected: import failure.
 
-- [ ] **Step 3: Implement immutable models and deterministic selection**
+- [x] **Step 3: Implement immutable models and deterministic selection**
 
 ```python
 # src/wft/inventory/models.py
@@ -418,7 +418,7 @@ def select_nodes(inventory: Inventory, selector: NodeSelector) -> tuple[Node, ..
     return tuple(sorted(selected, key=lambda node: node.name))
 ```
 
-- [ ] **Step 4: Run GREEN, add validation cases, and commit**
+- [x] **Step 4: Run GREEN, add validation cases, and commit**
 
 Run: `.venv/bin/pytest tests/inventory -q && .venv/bin/ruff check src tests && .venv/bin/mypy src`
 Expected: all pass.
@@ -436,7 +436,7 @@ git commit -m "feat: validate and select diagnostic nodes"
 - Create: `tests/scripts/test_manifest.py`
 - Create: `config/manifest.example.yaml`
 
-- [ ] **Step 1: Write failing hash, path, and OS tests**
+- [x] **Step 1: Write failing hash, path, and OS tests**
 
 ```python
 # tests/scripts/test_manifest.py
@@ -460,12 +460,12 @@ def test_rejects_hash_mismatch(tmp_path: Path) -> None:
         load_manifest(tmp_path / "manifest.yaml")
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `.venv/bin/pytest tests/scripts/test_manifest.py -q`
 Expected: import failure.
 
-- [ ] **Step 3: Implement models and validation**
+- [x] **Step 3: Implement models and validation**
 
 ```python
 # src/wft/scripts/models.py
@@ -551,7 +551,7 @@ def load_manifest(path: Path) -> Manifest:
     return manifest
 ```
 
-- [ ] **Step 4: Run GREEN and commit**
+- [x] **Step 4: Run GREEN and commit**
 
 Run: `.venv/bin/pytest tests/scripts/test_manifest.py -q && .venv/bin/ruff check src tests && .venv/bin/mypy src`
 Expected: all pass.
@@ -569,7 +569,7 @@ git commit -m "feat: validate diagnostic script manifests"
 - Create: `tests/scripts/conftest.py`
 - Create: `tests/scripts/test_snapshot.py`
 
-- [ ] **Step 1: Write local-repository happy path and cache-fallback tests**
+- [x] **Step 1: Write local-repository happy path and cache-fallback tests**
 
 ```python
 # tests/scripts/conftest.py
@@ -635,12 +635,12 @@ def test_fetch_failure_requires_explicit_cache_acceptance(fixture_repo: Path, tm
     assert cached.used_cache is True
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `.venv/bin/pytest tests/scripts/test_snapshot.py -q`
 Expected: import failure.
 
-- [ ] **Step 3: Implement the deep snapshot interface**
+- [x] **Step 3: Implement the deep snapshot interface**
 
 ```python
 # src/wft/scripts/git_source.py
@@ -831,12 +831,12 @@ def prepare_snapshot(
 
 Never execute from the mutable Git cache. M1 acceptance checks atomic publication and immutable snapshot reuse.
 
-- [ ] **Step 4: Add Git command injection and path tests, then run GREEN**
+- [x] **Step 4: Add Git command injection and path tests, then run GREEN**
 
 Run: `.venv/bin/pytest tests/scripts -q && .venv/bin/ruff check src tests && .venv/bin/mypy src`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/wft/scripts tests/scripts
@@ -849,7 +849,7 @@ git commit -m "feat: prepare immutable Git script snapshots"
 - Create: `src/wft/auth/password.py`
 - Create: `tests/auth/test_password.py`
 
-- [ ] **Step 1: Write the hash-file test**
+- [x] **Step 1: Write the hash-file test**
 
 ```python
 # tests/auth/test_password.py
@@ -869,7 +869,7 @@ def test_initializes_hash_without_plaintext(tmp_path: Path) -> None:
     assert path.stat().st_mode & 0o777 == 0o600
 ```
 
-- [ ] **Step 2: Run RED, implement, and run GREEN**
+- [x] **Step 2: Run RED, implement, and run GREEN**
 
 ```python
 # src/wft/auth/password.py
@@ -912,7 +912,7 @@ def verify_password(path: Path, password: str) -> bool:
 Run: `.venv/bin/pytest tests/auth/test_password.py -q`
 Expected: pass.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/wft/auth tests/auth
@@ -929,7 +929,7 @@ git commit -m "feat: initialize administrator credentials"
 - Create: `src/wft/cli/commands/scripts.py`
 - Create: `tests/cli/test_commands.py`
 
-- [ ] **Step 1: Write CLI contract tests**
+- [x] **Step 1: Write CLI contract tests**
 
 ```python
 # tests/cli/test_commands.py
@@ -950,12 +950,12 @@ def test_m1_help_exposes_only_available_commands() -> None:
     assert "run" not in result.stdout
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run: `.venv/bin/pytest tests/cli/test_commands.py -q`
 Expected: command assertion failure.
 
-- [ ] **Step 3: Register command groups and delegate to modules**
+- [x] **Step 3: Register command groups and delegate to modules**
 
 Command surface:
 
@@ -971,7 +971,7 @@ wft scripts sync --config PATH [--allow-cached-scripts]
 
 Each command must return exit 0 on success and exit 2 on configuration/Git/validation failure. Commands print JSON only when `--json` is supplied; secret values and key paths are omitted from JSON output.
 
-- [ ] **Step 4: Run all M1 checks**
+- [x] **Step 4: Run all M1 checks**
 
 Run:
 
@@ -985,7 +985,7 @@ Run:
 
 Expected: all commands exit 0; no legacy command appears.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/wft/cli tests/cli
@@ -999,15 +999,15 @@ git commit -m "feat: expose M1 diagnostic configuration commands"
 - Create: `docs/operations/configuration.md`
 - Create: `artifacts/acceptance/m1.md`
 
-- [ ] **Step 1: Document exact install and command examples**
+- [x] **Step 1: Document exact install and command examples**
 
 Document Python 3.12 setup, chmod 0600 requirements, fake inventory, read-only Deploy Key, cache fallback, Manifest fields, and the command surface from Task 7. Do not document M2+ commands as available.
 
-- [ ] **Step 2: Execute AC-001 through AC-006 and record evidence**
+- [x] **Step 2: Execute AC-001 through AC-006 and record evidence**
 
 Run the exact commands from `docs/spec/ACCEPTANCE_MATRIX_v1.0.md`, then record command, exit code, and test name in `artifacts/acceptance/m1.md`.
 
-- [ ] **Step 3: Verify the milestone**
+- [x] **Step 3: Verify the milestone**
 
 Run:
 
@@ -1021,7 +1021,7 @@ git diff --check
 
 Expected: all pass with AC-001 through AC-006 mapped to tests.
 
-- [ ] **Step 4: Commit and stop for milestone review**
+- [x] **Step 4: Commit and stop for milestone review**
 
 ```bash
 git add README.md docs/operations artifacts/acceptance/m1.md

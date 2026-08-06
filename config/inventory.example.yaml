@@ -1,52 +1,20 @@
-# Example inventory — fake nodes and fake credential references only.
-# No secret bodies ever belong in this file (NFR-S-01): auth uses references
-# resolved by the runtime (env://, vault://, op://, agent://, file://).
-#
-# Contract-11 payload shape: a top-level `nodes` list.
+# Fake nodes and fake absolute private-key paths only.
 nodes:
-  - node_id: node-a
+  - name: node-a
     host: 10.0.0.11
     port: 22
-    username: ops
-    auth:
-      method: key
-      credential_ref: env://WFT_KEY_NODE_A
-    groups: [web]
-    tags: [prod, canary]
-  - node_id: node-b
+    username: root
+    private_key_path: /run/secrets/node-a-key
+    os: ubuntu-24.04
+    groups: [batch]
+    tags: [memory, staging]
+    enabled: true
+  - name: node-b
     host: 10.0.0.12
     port: 22
     username: ops
-    auth:
-      method: key
-      credential_ref: env://WFT_KEY_NODE_B
-    groups: [web]
-    tags: [prod]
-  - node_id: node-c
-    host: 10.0.0.13
-    port: 2222
-    username: deploy
-    auth:
-      method: key
-      credential_ref: file:///etc/wft/keys/node-c.key
-    groups: [db]
-    tags: [prod]
-  - node_id: node-d
-    host: 10.0.0.14
-    port: 22
-    username: ops
-    auth:
-      method: agent
-      credential_ref: agent://ssh-agent
-    groups: [db, batch]
-    tags: [staging]
-  - node_id: node-e
-    host: 10.0.0.15
-    port: 22
-    username: ops
-    auth:
-      method: key
-      credential_ref: vault://wft/nodes/node-e
+    private_key_path: /run/secrets/node-b-key
+    os: ubuntu-22.04
     groups: [batch]
-    tags: [staging]
+    tags: [disk, staging]
     enabled: false
