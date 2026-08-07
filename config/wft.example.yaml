@@ -1,9 +1,10 @@
-# Example global WFT configuration. No secret bodies here.
-data_dir: ./data
-logs_dir: ./logs
-log_level: INFO
-vault_dir: null          # Obsidian Vault absolute path (configured later)
-known_hosts_path: ./data/known_hosts
-audit_path: ./logs/audit.jsonl
-# inventory_path: ./config/inventory.yaml
-# scripts_path: ./config/scripts.yaml
+data_dir: /var/lib/wft
+inventory_path: /etc/wft/inventory.yaml
+default_concurrency: 10
+script_repository:
+  url: ssh://git@example.invalid/diagnostics.git
+  branch: main
+  deploy_key_path: /run/secrets/scripts-deploy-key
+web:
+  bind_host: 10.0.0.5
+  port: 8080

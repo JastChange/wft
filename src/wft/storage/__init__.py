@@ -1,1 +1,1 @@
-"""storage module (Phase 2+)."""
+"""Authoritative filesystem storage primitives."""

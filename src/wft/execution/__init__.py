@@ -1,1 +1,1 @@
-"""execution module (Phase 2+)."""
+"""Node execution interfaces and implementations."""

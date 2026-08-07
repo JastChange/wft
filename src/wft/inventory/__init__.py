@@ -1,1 +1,1 @@
-"""Inventory loading, validation and selection."""
+"""Node inventory loading and deterministic selection."""

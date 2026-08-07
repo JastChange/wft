@@ -1,0 +1,13 @@
+schema_version: "1.0"
+scripts:
+  - id: example-check
+    path: example-check.sh
+    sha256: bd119a686da37ea895f2f88e20d89c449c110bd701ceee01a94f3c3bf5f6d7a8
+    interpreter: sh
+    timeout_seconds: 30
+    expected_exit_codes: [0]
+    read_only: true
+    supported_os: [ubuntu-22.04, ubuntu-24.04]
+plans:
+  - id: example-baseline
+    scripts: [example-check]
