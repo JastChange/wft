@@ -1,4 +1,5 @@
 """Deterministic loopback HTTP fault server for webhook/LLM tests."""
+
 from __future__ import annotations
 
 import asyncio

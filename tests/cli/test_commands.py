@@ -68,14 +68,15 @@ def _write_script_repository(path: Path) -> None:
     )
 
 
-def test_m1_help_exposes_only_available_commands() -> None:
+def test_help_exposes_m1_and_m2_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "admin" in result.stdout
     assert "config" in result.stdout
     assert "inventory" in result.stdout
     assert "scripts" in result.stdout
-    assert "run" not in result.stdout
+    assert "run" in result.stdout
+    assert "task" in result.stdout
 
 
 def test_admin_init_and_reset_print_each_generated_password_once(tmp_path: Path) -> None:

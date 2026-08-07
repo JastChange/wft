@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  m1-ci:
+  m2-ci:
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -43,6 +43,8 @@ jobs:
           wft config --help >/dev/null
           wft inventory --help >/dev/null
           wft scripts --help >/dev/null
+          wft run --help >/dev/null
+          wft task --help >/dev/null
       - name: Full unit test suite
         run: pytest -q
 

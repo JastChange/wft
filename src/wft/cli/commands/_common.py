@@ -1,7 +1,11 @@
 import json
+from pathlib import Path
 from typing import Any, NoReturn
 
 import typer
+
+from wft.storage.task_store import TaskStore
+from wft.tasks.runner import mark_abandoned_tasks_failed
 
 
 def emit(payload: dict[str, Any], *, json_output: bool, message: str) -> None:
@@ -22,3 +26,7 @@ def fail(message: str, *, json_output: bool = False) -> NoReturn:
     else:
         typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(code=2)
+
+
+def reconcile_abandoned(data_dir: Path) -> None:
+    mark_abandoned_tasks_failed(TaskStore(data_dir))

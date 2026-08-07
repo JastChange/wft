@@ -4,7 +4,7 @@ WFT 1.0 面向单个运维人员，在一台 Linux 控制服务器上对 Ubuntu 
 
 ## 当前状态
 
-分支 `rewrite/node-diagnostics` 已完成 **M1：CLI、配置、Inventory 与脚本快照**：
+分支 `rewrite/node-diagnostics` 已完成 **M2：手动任务执行与权威结果存储**：
 
 - Python 3.12 / Typer CLI 基线；
 - 权限为 `0600` 的类型化私有配置；
@@ -12,8 +12,12 @@ WFT 1.0 面向单个运维人员，在一台 Linux 控制服务器上对 Ubuntu 
 - 外部 Git 仓库最新脚本获取、Manifest 门禁和不可变快照；
 - 需要操作员明确同意的缓存脚本回退；
 - CLI 生成的管理员密码和 Argon2 哈希文件。
+- `installation_validation` 与 `fault_diagnosis` 两类手动任务；
+- AsyncSSH/SFTP 执行、自动接受并记录 Host Key、节点并发与节点内串行脚本；
+- UUIDv7 任务、原子 JSON、逐字节原始输出、任务查询和确认删除；
+- 超时后继续、节点故障隔离、无自动重试、Ctrl-C 取消和崩溃残留判定。
 
-任务执行、SSH、权威结果存储、只读 Web、Webhook、AI 和 Obsidian 导出将在 M2～M6 交付。当前版本不能执行诊断任务，也不应作为完整 WFT 1.0 部署。
+只读 Web、派生索引、Webhook、AI 和 Obsidian 导出将在 M3～M6 交付。M2 Web 页面尚未交付，CLI 和权威文件是当前可用界面。
 
 ## 安装
 
@@ -26,7 +30,7 @@ wft --help
 
 Python 要求为 `>=3.12,<3.13`。
 
-## M1 命令
+## M1/M2 命令
 
 ```text
 wft admin init --auth-file PATH
@@ -36,7 +40,14 @@ wft inventory check --config PATH [--json]
 wft inventory select --config PATH [--node NAME] [--group GROUP] [--tag TAG] [--all] [--json]
 wft scripts check --config PATH [--json]
 wft scripts sync --config PATH [--allow-cached-scripts] [--json]
+wft run installation-validation --config PATH SELECTOR SCRIPT_SELECTION [--concurrency N] [--allow-cached-scripts] [--json]
+wft run fault-diagnosis --config PATH SELECTOR SCRIPT_SELECTION [--concurrency N] [--allow-cached-scripts] [--json]
+wft task list --config PATH [--json]
+wft task show TASK_ID --config PATH [--json]
+wft task delete TASK_ID --config PATH --reason TEXT
 ```
+
+`SELECTOR` 是重复的 `--node/--group/--tag` 或单独的 `--all`；`SCRIPT_SELECTION` 是重复的 `--script` 或一个 `--plan`。详细执行和退出码见[任务操作指南](docs/operations/tasks.md)。
 
 详细配置、Manifest 和操作步骤见[配置与脚本操作指南](docs/operations/configuration.md)。示例文件位于 `config/`，其中只有假节点、假地址和假密钥路径。
 
@@ -49,6 +60,7 @@ wft scripts sync --config PATH [--allow-cached-scripts] [--json]
 - [需求追踪矩阵](docs/spec/TRACEABILITY_v1.0.md)
 - [交付计划](docs/spec/DELIVERY_PLAN_v1.0.md)
 - [M1 验收证据](artifacts/acceptance/m1.md)
+- [M2 验收证据](artifacts/acceptance/m2.md)
 - [领域词汇](CONTEXT.md)
 - [架构决策](docs/adr/)
 
@@ -60,7 +72,10 @@ wft scripts sync --config PATH [--allow-cached-scripts] [--json]
 - YAML、JSON、日志和 Git 仓库中只保存密钥路径，不保存私钥正文。
 - WFT 直接信任配置的脚本仓库 URL 和分支，不验证 commit/tag 签名。
 - 每次同步先尝试远端最新提交；远端失败时，只有交互确认或 `--allow-cached-scripts` 才能使用已验证缓存。
-- 目前只支持 M1 手动命令，不提供任务执行、Scheduler、自动恢复或自动重试。
+- 每个任务只执行一次，不提供 Scheduler、resume、自动恢复或自动重试。
+- 权威记录只在 `<data_dir>/tasks/`；SQLite 即使存在也不是权威数据源。
+- SSH 使用 `known_hosts=None` 自动接受 Host Key，并把实际算法和 SHA-256 指纹写入节点快照。
+- 原始 stdout/stderr 不截断、不解码，容量由操作员负责监控。
 
 ## 贡献流程
 

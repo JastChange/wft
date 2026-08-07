@@ -5,6 +5,7 @@ Provides key-based auth, an exec subsystem that runs commands locally (so a
 and a local-filesystem SFTP subsystem rooted at ``/`` so uploaded scripts land
 in real ``/tmp``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,6 +13,7 @@ import hashlib
 import os
 import shlex
 import signal as _signal
+from contextlib import suppress
 
 import asyncssh
 from asyncssh.sftp import (
@@ -22,16 +24,18 @@ from asyncssh.sftp import (
     FXF_TRUNC,
     FXF_WRITE,
     SFTPError,
+    SFTPName,
     SFTPNoSuchFile,
     SFTPServer,
-    SFTPName,
 )
 
 
 def _pflags_to_os(pflags: int) -> tuple[int, int]:
     """Translate SFTP protocol open flags (FXF_*) into os.open flags + mode."""
-    flags = os.O_RDWR if pflags & FXF_READ and pflags & FXF_WRITE else (
-        os.O_WRONLY if pflags & FXF_WRITE else os.O_RDONLY
+    flags = (
+        os.O_RDWR
+        if pflags & FXF_READ and pflags & FXF_WRITE
+        else (os.O_WRONLY if pflags & FXF_WRITE else os.O_RDONLY)
     )
     if pflags & FXF_APPEND:
         flags |= os.O_APPEND
@@ -169,6 +173,10 @@ async def _run_command(process: asyncssh.SSHServerProcess) -> None:
             return
         # Emulate a Linux target: ensure /sbin|/usr/sbin (where sha256sum
         # lives on macOS) are on PATH regardless of the host shell profile.
+        # macOS lacks util-linux setsid. The subprocess below already creates
+        # a new session, so remove only the production wrapper's setsid token.
+        if command.startswith("exec setsid "):
+            command = "exec " + command.removeprefix("exec setsid ")
         env = {**os.environ, "PATH": "/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin"}
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -182,10 +190,8 @@ async def _run_command(process: asyncssh.SSHServerProcess) -> None:
         )
 
         def _kill_group(sig: int) -> None:
-            try:
+            with suppress(ProcessLookupError, PermissionError):
                 os.killpg(proc.pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass
 
         def _signal_received(name: str) -> None:
             _kill_group(_SIGNALS.get(name, _signal.SIGTERM))
@@ -203,10 +209,8 @@ async def _run_command(process: asyncssh.SSHServerProcess) -> None:
         returncode = proc.returncode
         process.exit((returncode & 0xFF) if returncode is not None else 0)
     except Exception:  # never let a broken command kill the server
-        try:
+        with suppress(Exception):
             process.exit(1)
-        except Exception:
-            pass
 
 
 class TestSSHServer(asyncssh.SSHServer):
@@ -228,8 +232,8 @@ class RunningServer:
             lambda: TestSSHServer(),
             self._host,
             0,
-            server_host_keys=[self._host_key_path],
-            authorized_client_keys=self._authorized_keys,
+            server_host_keys=[os.fspath(self._host_key_path)],
+            authorized_client_keys=os.fspath(self._authorized_keys),
             process_factory=_run_command,
             sftp_factory=_LocalSFTPServer,
             sftp_version=6,

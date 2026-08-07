@@ -8,13 +8,14 @@ from wft.inventory.loader import load_inventory
 from wft.inventory.models import NodeSelector
 from wft.inventory.selector import select_nodes
 
-from ._common import emit, fail
+from ._common import emit, fail, reconcile_abandoned
 
 app = typer.Typer(help="Validate inventory and select diagnostic nodes.")
 
 
 def _load(config_path: Path):  # type: ignore[no-untyped-def]
     config = load_config(config_path)
+    reconcile_abandoned(config.data_dir)
     return load_inventory(config.inventory_path)
 
 

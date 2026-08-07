@@ -1,4 +1,4 @@
-# M1 配置与脚本操作指南
+# M1/M2 配置与脚本操作指南
 
 ## 1. 准备 Python 3.12
 
@@ -9,7 +9,7 @@ python -m pip install -e '.[test]'
 wft --help
 ```
 
-WFT 1.0 锁定 Python `>=3.12,<3.13`。M1 CLI 只包含 `admin`、`config`、`inventory` 和 `scripts` 四组命令。
+WFT 1.0 锁定 Python `>=3.12,<3.13`，安装包包含 AsyncSSH。CLI 包含 `admin`、`config`、`inventory`、`scripts`、`run` 和 `task` 六组命令。
 
 ## 2. 创建私有配置
 
@@ -60,7 +60,7 @@ nodes:
 - 私钥必须使用绝对路径，WFT 不读取或输出私钥正文；
 - 目标系统只允许 `ubuntu-22.04` 或 `ubuntu-24.04`；
 - 选择结果只包含启用节点，按节点名排序并去重；
-- 显式节点、group、tag 和 `--all` 使用并集语义。
+- 显式节点、group 和 tag 使用并集语义；运行任务时 `--all` 必须单独使用。
 
 验证与选择：
 
@@ -109,9 +109,10 @@ wft scripts sync --config /etc/wft/wft.yaml --allow-cached-scripts
 
 fetch 失败时，CLI 先显示缓存 commit、提交时间、仓库和分支。操作员必须在交互提示中确认，或显式传入 `--allow-cached-scripts`。拒绝、无可用缓存或 JSON 模式未提供显式参数时以退出码 `2` 失败。成功 JSON 中以 `used_cached_snapshot` 记录是否使用缓存。
 
-## 7. M1 退出码
+## 7. M1/M2 退出码
 
 - `0`：命令完成并通过验证；
-- `2`：配置、Inventory、Manifest、Git、缓存授权或文件操作失败。
+- `1`：任务完成，但发现问题，或安装验证结论为 `FAIL/INCONCLUSIVE`；
+- `2`：配置、Inventory、Manifest、Git、缓存授权、文件操作失败，或任务未完成/被取消。
 
-诊断业务退出码 `1` 从 M2 任务执行阶段开始使用。
+任务创建、执行、查询与删除见[任务操作指南](tasks.md)。

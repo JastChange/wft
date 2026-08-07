@@ -11,13 +11,14 @@ from wft.scripts.snapshot import (
     prepare_snapshot,
 )
 
-from ._common import emit, fail
+from ._common import emit, fail, reconcile_abandoned
 
 app = typer.Typer(help="Validate and synchronize diagnostic scripts.")
 
 
 def _request(config_path: Path) -> SnapshotRequest:
     config = load_config(config_path)
+    reconcile_abandoned(config.data_dir)
     return SnapshotRequest(
         repository_url=config.script_repository.url,
         branch=config.script_repository.branch,

@@ -5,7 +5,7 @@ import typer
 
 from wft.config.loader import load_config
 
-from ._common import emit, fail
+from ._common import emit, fail, reconcile_abandoned
 
 app = typer.Typer(help="Validate the private WFT configuration.")
 
@@ -21,6 +21,7 @@ def check_config(
     """Load and validate the private application configuration."""
     try:
         loaded = load_config(config_path)
+        reconcile_abandoned(loaded.data_dir)
     except (OSError, TypeError, ValueError) as error:
         fail(str(error), json_output=json_output)
     payload = {
